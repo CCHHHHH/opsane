@@ -17,6 +17,13 @@ interface TourStep {
 
 const steps: TourStep[] = [
   {
+    target: '[data-onboarding="config"]',
+    eyebrow: '模型配置',
+    title: '先连接 LLM',
+    description: '在配置页填写 Provider、模型、API Key 和 Base URL，先测试连接，成功后保存。密钥由本机后端保存，页面不会回显原值。',
+    placement: 'bottom',
+  },
+  {
     target: '[data-onboarding="servers"]',
     eyebrow: '准备资源',
     title: '先登记服务器',

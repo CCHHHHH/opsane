@@ -21,6 +21,12 @@ const navItems = [
   { to: '/audit', label: '审计', icon: '☷' },
 ]
 
+const onboardingNavTargets: Record<string, string> = {
+  '/servers': 'servers',
+  '/config': 'config',
+  '/audit': 'audit',
+}
+
 const currentTitle = computed(() => String(route.meta.label ?? '工作台'))
 const themeSwitchLabel = computed(() => theme.value === 'dark' ? '切换到浅色模式' : '切换到深色模式')
 
@@ -50,7 +56,7 @@ function openOnboarding() {
           :key="item.to"
           :to="item.to"
           class="nav-link"
-          :data-onboarding="item.to === '/servers' ? 'servers' : item.to === '/audit' ? 'audit' : undefined"
+          :data-onboarding="onboardingNavTargets[item.to]"
         >
           <span class="nav-icon">{{ item.icon }}</span>
           <span>{{ item.label }}</span>
