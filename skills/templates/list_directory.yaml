@@ -1,0 +1,28 @@
+name: list_directory
+description: 查看指定目录内容
+category: filesystem
+triggers:
+  - 查看目录
+  - 目录内容
+  - 目录下的内容
+  - 看下目录
+  - 看下/
+  - 查询/
+params:
+  - name: target
+    type: string
+    required: true
+    description: 目标服务器别名
+  - name: path
+    type: string
+    required: true
+    pattern: "^/"
+    description: 要查看的绝对路径
+steps:
+  - name: 目录内容
+    command: "ssh {{target}} 'ls -la {{path}}'"
+    intent: "查看 {{target}} 上 {{path}} 目录的详细内容"
+    explanation: "使用 ls -la 列出目录内文件，包含隐藏文件、权限、属主、大小和修改时间。"
+    confirm: true
+safety:
+  default_confirm_mode: auto_safe

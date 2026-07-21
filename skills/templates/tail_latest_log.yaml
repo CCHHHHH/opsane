@@ -1,0 +1,33 @@
+name: tail_latest_log
+description: 查看日志目录中最近更新的日志内容
+category: logs
+triggers:
+  - 查看日志内容
+  - 看日志内容
+  - 看最近日志
+  - 最新日志
+  - 错误日志
+  - 看报错
+params:
+  - name: target
+    type: string
+    required: true
+    description: 目标服务器别名
+  - name: path
+    type: string
+    required: true
+    pattern: "^/"
+    description: 日志目录绝对路径
+  - name: lines
+    type: integer
+    required: false
+    default: 200
+    description: 读取行数
+steps:
+  - name: 最新日志内容
+    command: "ssh {{target}} 'tail -n {{lines}} \"$(ls -t {{path}}/*.log {{path}}/*.out 2>/dev/null | head -n 1)\"'"
+    intent: "读取 {{target}} 上 {{path}} 目录最近更新的日志内容"
+    explanation: "先用 ls -t 按更新时间选择最新的 .log/.out 文件，再用 tail -n {{lines}} 输出末尾日志内容，避免读取整份大日志。"
+    confirm: true
+safety:
+  default_confirm_mode: auto_safe

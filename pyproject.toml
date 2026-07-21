@@ -1,0 +1,59 @@
+[project]
+name = "shell-agent"
+version = "0.1.0"
+description = "Opsane 智能运维工作台"
+requires-python = ">=3.11"
+dependencies = [
+    "click>=8.1",
+    "rich>=13.0",
+    "asyncssh>=2.14",
+    "aiosqlite>=0.20",
+    "pydantic>=2.5",
+    "pyyaml>=6.0",
+    "loguru>=0.7",
+    "openai>=1.30",
+    "fastapi>=0.110",
+    "python-multipart>=0.0.9",
+    "pypdf>=5.0",
+    "openpyxl>=3.1",
+    "uvicorn[standard]>=0.29",
+    "websockets>=12.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+]
+
+[project.scripts]
+opsane = "shell_agent.cli:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["shell_agent*"]
+namespaces = false
+exclude = [
+    "tests*",
+    "config*",
+    "data*",
+    "skills*",
+    "plugins*",
+    "shell_agent.web.frontend*",
+]
+
+[tool.setuptools.package-data]
+"shell_agent.attachments" = ["*.swift"]
+"shell_agent.web" = [
+    "static/index.html",
+    "static/next/*",
+    "static/next/assets/*",
+]
+
+[tool.setuptools.data-files]
+"skills/templates" = ["skills/templates/*.yaml"]
+"share/shell-agent/config" = [".env.example", "config/*.yaml.example"]
+"share/shell-agent/config/safety" = ["config/safety/*.yaml.example"]

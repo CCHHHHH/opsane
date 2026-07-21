@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="dark">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="theme-color" content="#07111d" />
+    <script>
+      (() => {
+        try {
+          const theme = localStorage.getItem('opsane-theme') === 'light' ? 'light' : 'dark'
+          document.documentElement.dataset.theme = theme
+          document.documentElement.style.colorScheme = theme
+          document.querySelector('meta[name="theme-color"]').content = theme === 'light' ? '#f4f8fc' : '#07111d'
+        } catch (_) {
+          document.documentElement.dataset.theme = 'dark'
+        }
+      })()
+    </script>
+    <link rel="icon" type="image/svg+xml" href="/assets/favicon.svg?v=opsane-2" />
+    <title>Opsane - 智能运维工作台</title>
+  </head>
+  <body>
+    <div id="app"></div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

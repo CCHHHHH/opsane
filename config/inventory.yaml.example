@@ -1,0 +1,56 @@
+# 服务器清单
+# 复制为 inventory.yaml 并填入实际值
+servers:
+  - alias: prod-order-01
+    host: 10.0.1.10
+    port: 22
+    env: prod
+    role: app
+    ssh_credential: default
+    tags: [critical]
+  - alias: test-app-01
+    host: 10.0.2.10
+    port: 22
+    env: test
+    role: app
+    ssh_credential: default
+    tags: [java]
+
+# 确定性部署 Runbook 仅允许 dev/test，且当前模板要求 servers 只有一台。
+services:
+  - id: demo-service
+    name: demo-service
+    env: test
+    servers: [test-app-01]
+    deploy_dir: /data/app/demo-service
+    artifact_path: /data/app/demo-service/lib/demo-service.jar
+    backup_dir: /data/app/demo-service/.shell-agent/backups
+    artifact_type: jar
+    runtime: standalone
+    startup_timeout_seconds: 60
+    health_url: http://127.0.0.1:8080/health
+    ports: [8080]
+    start_cmd: /data/app/demo-service/bin/start.sh
+    stop_cmd: /data/app/demo-service/bin/stop.sh
+    status_cmd: /data/app/demo-service/bin/status.sh
+    verification_status: verified
+    revision: 1
+
+  # Tomcat WAR 模板会归档旧的 WAR 和已解压 Context，失败时可恢复两者。
+  - id: demo-platform
+    name: demo-platform
+    env: test
+    servers: [test-app-01]
+    deploy_dir: /opt/apache-tomcat-demo
+    artifact_path: /opt/apache-tomcat-demo/webapps/demo-platform.war
+    backup_dir: /data/backup/demo-platform
+    artifact_type: war
+    runtime: tomcat
+    startup_timeout_seconds: 90
+    health_url: http://127.0.0.1:8080/demo-platform/health
+    ports: [8080]
+    start_cmd: /opt/apache-tomcat-demo/bin/startup.sh
+    stop_cmd: /opt/apache-tomcat-demo/bin/shutdown.sh
+    status_cmd: /opt/apache-tomcat-demo/bin/status.sh
+    verification_status: verified
+    revision: 1

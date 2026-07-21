@@ -1,0 +1,25 @@
+environments:
+  dev:
+    require_secondary_confirm: false
+    secondary_confirm_levels:
+      - critical
+      - dangerous
+    forbidden_executors: []
+
+  test:
+    require_secondary_confirm: false
+    secondary_confirm_levels:
+      - critical
+      - dangerous
+    forbidden_executors: []
+
+  prod:
+    require_secondary_confirm: true
+    secondary_confirm_levels:
+      - critical
+      - dangerous
+    forbidden_executors: []
+    # Optional time window example. Omit this block to allow all hours.
+    # time_window:
+    #   dangerous_allowed:
+    #     - "10:00-18:00"

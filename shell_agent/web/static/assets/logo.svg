@@ -1,0 +1,29 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" role="img" aria-labelledby="title desc">
+  <title id="title">Opsane logo</title>
+  <desc id="desc">A terminal prompt and check mark inside a blue-to-green monitor frame.</desc>
+  <defs>
+    <linearGradient id="opsane-frame" x1="24" y1="36" x2="232" y2="218" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#1768ff"/>
+      <stop offset=".48" stop-color="#00bce8"/>
+      <stop offset="1" stop-color="#34ea98"/>
+    </linearGradient>
+    <linearGradient id="opsane-screen" x1="48" y1="58" x2="211" y2="190" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#172b58"/>
+      <stop offset="1" stop-color="#103f42"/>
+    </linearGradient>
+    <linearGradient id="opsane-check" x1="157" y1="137" x2="213" y2="88" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#04bfe6"/>
+      <stop offset="1" stop-color="#35ed9b"/>
+    </linearGradient>
+    <filter id="opsane-shadow" x="-30%" y="-30%" width="160%" height="170%">
+      <feDropShadow dx="0" dy="8" stdDeviation="8" flood-color="#06101f" flood-opacity=".32"/>
+    </filter>
+  </defs>
+  <g filter="url(#opsane-shadow)">
+    <rect x="40" y="50" width="176" height="142" rx="31" fill="url(#opsane-screen)" stroke="#fff" stroke-width="10"/>
+    <path d="M78 28h100c30 0 54 24 54 54v82c0 30-24 54-54 54h-35m-30 0H78c-30 0-54-24-54-54V82c0-30 24-54 54-54" fill="none" stroke="url(#opsane-frame)" stroke-width="16" stroke-linecap="round" stroke-linejoin="round"/>
+    <path d="M73 91l34 27-34 27" fill="none" stroke="#f8fbff" stroke-width="14" stroke-linecap="round" stroke-linejoin="round"/>
+    <path d="M119 151h34" fill="none" stroke="#f8fbff" stroke-width="14" stroke-linecap="round"/>
+    <path d="M161 117l18 18 35-43" fill="none" stroke="url(#opsane-check)" stroke-width="14" stroke-linecap="round" stroke-linejoin="round"/>
+  </g>
+</svg>

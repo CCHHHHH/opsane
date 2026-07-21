@@ -1,0 +1,47 @@
+# Shell Agent 主配置
+agent:
+  name: shell-agent
+  version: 0.1.0
+
+# LLM 配置
+llm:
+  provider: openai
+  model: gpt-4o-mini
+  summary_model: ""  # 留空时复用主模型
+  image_analysis_enabled: false  # 显式开启后图片会发送给配置的视觉模型；默认仅本地 OCR
+  vision_model: ""  # 留空时复用主模型；主模型不支持图片时请填写视觉模型
+  vision_max_bytes: 12582912  # 单张图片发送给视觉模型的上限（12 MB）
+  temperature: 0.3
+  max_tokens: 4096
+  timeout: 60
+
+# SSH 执行器
+ssh:
+  max_per_host: 3
+  idle_timeout: 300
+  total_max: 50
+  default_timeout: 60
+  trust_unknown_hosts: false  # dev 环境可设 true；生产建议保持 false
+
+# 存储
+storage:
+  sqlite_path: data/shell_agent.db
+
+# 会话
+session:
+  idle_timeout_minutes: 30
+  pending_confirm_timeout_seconds: 300
+
+# 会话上下文语义摘要
+context:
+  semantic_summary_enabled: true
+  summary_trigger_events: 16
+  summary_trigger_chars: 12000
+  recent_events: 8
+  summary_max_chars: 3200
+  summary_max_tokens: 1200
+
+# 日志
+logging:
+  level: INFO
+  dir: data/logs

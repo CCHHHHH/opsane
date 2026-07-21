@@ -1,0 +1,10 @@
+patterns:
+  - name: remove_all_logs
+    level: dangerous
+    pattern: "\\brm\\s+-rf\\s+/data/app/.*/logs\\b"
+    reason: "批量删除应用日志会破坏排查证据"
+
+  - name: direct_disk_write
+    level: critical
+    pattern: "\\bdd\\b.*\\bof=/dev/"
+    reason: "直接写块设备可能破坏磁盘数据"

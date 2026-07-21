@@ -1,0 +1,22 @@
+name: java_processes
+description: 查看服务器上的 Java 进程
+category: observe
+triggers:
+  - java程序
+  - java 程序
+  - java进程
+  - java 进程
+  - 运行了哪些java
+params:
+  - name: target
+    type: string
+    required: true
+    description: 目标服务器别名
+steps:
+  - name: Java 进程
+    command: "ssh {{target}} 'ps -ef | grep java | grep -v grep'"
+    intent: "查看 {{target}} 上运行的 Java 进程"
+    explanation: "使用 ps -ef 列出进程，通过 grep java 过滤 Java 进程，并排除 grep 命令本身。"
+    confirm: true
+safety:
+  default_confirm_mode: auto_safe

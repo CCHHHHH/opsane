@@ -1,0 +1,22 @@
+name: resource_summary
+description: 查看服务器整体资源占用
+category: observe
+triggers:
+  - 资源情况
+  - 资源占用
+  - 机器状态
+  - 系统负载
+  - 负载情况
+params:
+  - name: target
+    type: string
+    required: true
+    description: 目标服务器别名
+steps:
+  - name: 资源概览
+    command: "ssh {{target}} 'uptime && echo \"---\" && free -h && echo \"---\" && df -h'"
+    intent: "查看 {{target}} 的系统负载、内存和磁盘使用情况"
+    explanation: "通过 uptime 查看运行时间和平均负载，free -h 查看内存和 swap，df -h 查看各挂载点磁盘空间。"
+    confirm: true
+safety:
+  default_confirm_mode: auto_safe
