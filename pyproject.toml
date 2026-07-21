@@ -1,6 +1,6 @@
 [project]
 name = "shell-agent"
-version = "0.1.1"
+version = "0.1.2"
 description = "Opsane 智能运维工作台"
 requires-python = ">=3.11"
 dependencies = [

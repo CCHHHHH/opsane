@@ -26,6 +26,11 @@ def test_packaged_web_assets_include_brand_files() -> None:
     static_root = WEB_ROOT / "static"
     assert (static_root / "assets" / "logo.svg").is_file()
     assert (static_root / "assets" / "favicon.svg").is_file()
+    assert (static_root / "assets" / "favicon-32.png").is_file()
+
+    index = (static_root / "next" / "index.html").read_text(encoding="utf-8")
+    assert "/assets/favicon.svg?v=opsane-3" in index
+    assert "/assets/favicon-32.png?v=opsane-3" in index
 
     pyproject = tomllib.loads((PROJECT_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
     package_data = pyproject["tool"]["setuptools"]["package-data"]["shell_agent.web"]

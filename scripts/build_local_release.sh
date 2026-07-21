@@ -47,6 +47,7 @@ from zipfile import ZipFile
 
 wheel_path = Path(sys.argv[1])
 required_assets = {
+    "shell_agent/web/static/assets/favicon-32.png",
     "shell_agent/web/static/assets/favicon.svg",
     "shell_agent/web/static/assets/logo.svg",
     "shell_agent/web/static/next/index.html",
