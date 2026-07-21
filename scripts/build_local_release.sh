@@ -37,7 +37,29 @@ cp config/safety/*.yaml.example "$SOURCE_DIR/config/safety/"
 cp skills/templates/*.yaml "$SOURCE_DIR/skills/templates/"
 
 "$PYTHON_BIN" -m pip wheel "$SOURCE_DIR" --no-deps --wheel-dir "$WHEEL_DIR"
-cp "$WHEEL_DIR"/*.whl "$STAGE_DIR/packages/"
+WHEEL_PATH="$(find "$WHEEL_DIR" -maxdepth 1 -type f -name '*.whl' -print -quit)"
+[[ -n "$WHEEL_PATH" ]] || { echo "Opsane wheel was not created" >&2; exit 1; }
+
+"$PYTHON_BIN" - "$WHEEL_PATH" <<'PY'
+from pathlib import Path
+import sys
+from zipfile import ZipFile
+
+wheel_path = Path(sys.argv[1])
+required_assets = {
+    "shell_agent/web/static/assets/favicon.svg",
+    "shell_agent/web/static/assets/logo.svg",
+    "shell_agent/web/static/next/index.html",
+}
+with ZipFile(wheel_path) as wheel:
+    packaged_files = set(wheel.namelist())
+
+missing = sorted(required_assets - packaged_files)
+if missing:
+    raise SystemExit(f"wheel is missing required Web assets: {', '.join(missing)}")
+PY
+
+cp "$WHEEL_PATH" "$STAGE_DIR/packages/"
 
 cp packaging/local/install.command "$STAGE_DIR/"
 cp packaging/local/start.command "$STAGE_DIR/"

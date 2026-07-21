@@ -237,8 +237,8 @@ sudo apt-get install libreoffice
 构建结果：
 
 ```text
-release/Opsane-0.1.0-local.zip
-release/Opsane-0.1.0-local.zip.sha256
+release/Opsane-<version>-local.zip
+release/Opsane-<version>-local.zip.sha256
 ```
 
 只需要发送 ZIP；SHA-256 文件可用于接收方校验。发行包包含 Python wheel、macOS/Linux

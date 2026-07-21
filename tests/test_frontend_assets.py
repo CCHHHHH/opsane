@@ -2,6 +2,7 @@
 
 from pathlib import Path
 import re
+import tomllib
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -19,6 +20,16 @@ def test_vue_workbench_build_references_existing_assets() -> None:
     assert references
     for reference in references:
         assert (static_root / reference.removeprefix("/")).is_file(), reference
+
+
+def test_packaged_web_assets_include_brand_files() -> None:
+    static_root = WEB_ROOT / "static"
+    assert (static_root / "assets" / "logo.svg").is_file()
+    assert (static_root / "assets" / "favicon.svg").is_file()
+
+    pyproject = tomllib.loads((PROJECT_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    package_data = pyproject["tool"]["setuptools"]["package-data"]["shell_agent.web"]
+    assert "static/assets/*" in package_data
 
 
 def test_vue_components_use_transport_modules_instead_of_browser_globals() -> None:

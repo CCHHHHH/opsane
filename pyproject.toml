@@ -1,6 +1,6 @@
 [project]
 name = "shell-agent"
-version = "0.1.0"
+version = "0.1.1"
 description = "Opsane 智能运维工作台"
 requires-python = ">=3.11"
 dependencies = [
@@ -49,6 +49,7 @@ exclude = [
 "shell_agent.attachments" = ["*.swift"]
 "shell_agent.web" = [
     "static/index.html",
+    "static/assets/*",
     "static/next/*",
     "static/next/assets/*",
 ]
