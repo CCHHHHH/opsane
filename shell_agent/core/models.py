@@ -74,9 +74,16 @@ class PendingCommand:
     cwd_update: bool = False
     step_index: int = 1
     max_steps: int = 0  # 0 means LLM-driven without a fixed product step limit.
-    step_queue: list[dict[str, str]] = field(default_factory=list)
+    step_queue: list[dict[str, Any]] = field(default_factory=list)
     skill_name: str | None = None
     step_name: str | None = None
+    skill_version: str = ""
+    skill_hash: str = ""
+    skill_default_confirm_mode: str = "interactive"
+    skill_force_confirm: bool = False
+    skill_on_failure: str = "abort"
+    skill_had_failures: bool = False
+    timeout_seconds: int | None = None
     policy_blocked: bool = False
     policy_block_reason: str = ""
     requires_secondary_confirm: bool = False

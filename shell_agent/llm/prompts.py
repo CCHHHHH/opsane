@@ -308,6 +308,7 @@ KNOWLEDGE_EXTRACTION_PROMPT_TEMPLATE = """你是 Opsane 的知识提取器。只
 - 密码、Token、私钥、连接串秘密和临时口令绝不能输出。
 - profile_changes 只填写证据明确支持的字段，不确定的字段不要输出。
 - target 只能使用给定的服务器别名。
+- 只有当 target 属于现有服务画像的 servers 时，才填写该画像的 service_id；同名服务位于其他服务器时 service_id 留空，不能覆盖其他实例。
 """
 
 CONTEXT_SUMMARY_PROMPT_TEMPLATE = """你负责压缩 Opsane 的较早会话上下文。
@@ -334,4 +335,38 @@ CONTEXT_SUMMARY_PROMPT_TEMPLATE = """你负责压缩 Opsane 的较早会话上�
 ## 失败、异常与已排除方向
 ## 待处理或待验证
 ## 用户约束与当前目标
+"""
+
+
+SKILL_FLOW_CLUSTERING_PROMPT_TEMPLATE = """你是 Opsane 的历史运维流程分组器。
+
+下面是经过脱敏的成功任务摘要。每个任务已经由系统确认：全部步骤成功、没有 Critical 命令、不是已有 Skill 的执行记录。
+
+任务摘要:
+{flows_json}
+
+你只能判断哪些任务表达了同一个可复用运维目标。不要生成、修改或补充命令，不要输出 YAML，不要推断输入中不存在的步骤。
+
+只输出 JSON:
+```json
+{{
+  "groups": [
+    {{
+      "task_ids": ["task-id-1", "task-id-2", "task-id-3"],
+      "label": "简短流程名称",
+      "description": "这一组任务共同完成什么目标",
+      "rationale": "为什么这些任务属于同一流程"
+    }}
+  ]
+}}
+```
+
+必须遵守:
+- 只使用输入中存在的 task_id。
+- 每个任务最多出现在一个分组中。
+- 只有步骤数相同、步骤目的和顺序相同的任务才能归为一组。
+- 命令只是证据；命令结构差异过大、目标不明确或只是主题相近时不要归组。
+- 分组不足 {min_occurrences} 个任务时不要输出。
+- label、description、rationale 不得包含密码、Token、API Key、私钥或连接凭证。
+- 没有可靠分组时返回 {{"groups": []}}。
 """

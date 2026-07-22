@@ -6,6 +6,7 @@ import deploymentRunCardSource from '../components/chat/DeploymentRunCard.vue?ra
 import executionStepSource from '../components/chat/ExecutionStep.vue?raw'
 import onboardingTourSource from '../components/common/OnboardingTour.vue?raw'
 import chatPageSource from './ChatPage.vue?raw'
+import serversPageSource from './ServersPage.vue?raw'
 import terminalPageSource from './TerminalPage.vue?raw'
 
 function rule(source: string, selector: string): string {
@@ -36,6 +37,18 @@ describe('full-height workbench layout contract', () => {
       expect(button).toMatch(/height\s*:\s*28px/)
       expect(button).toMatch(/white-space\s*:\s*nowrap/)
     }
+  })
+
+  it('keeps a single server card at a stable readable width', () => {
+    const declarations = rule(serversPageSource, '.server-grid')
+    expect(declarations).toMatch(/repeat\(auto-fill,\s*minmax\(300px,\s*380px\)\)/)
+    expect(declarations).toMatch(/justify-content\s*:\s*start/)
+  })
+
+  it('tests new or changed SSH connection details before saving a server', () => {
+    expect(serversPageSource).toContain('await inventory.testServerConnection(input)')
+    expect(serversPageSource).toContain("? '测试并保存'")
+    expect(serversPageSource).toContain("if ((!originalAlias.value || connectionChanged) && !serverConnectionVerified.value)")
   })
 
   it('keeps timeline entries at their content height so execution results remain visible', () => {

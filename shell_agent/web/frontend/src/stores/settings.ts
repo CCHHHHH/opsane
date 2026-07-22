@@ -47,11 +47,37 @@ export interface SafetyClassification {
 }
 
 export interface SkillDetail extends SkillRecord {
+  version?: string
+  definition_hash?: string
   category?: string
   source?: string
   params?: Array<Record<string, unknown>>
   step_items?: Array<Record<string, unknown>>
   safety?: Record<string, unknown>
+}
+
+export interface SkillPreview {
+  ok: boolean
+  params: Record<string, unknown>
+  missing_params: string[]
+  steps: Array<Record<string, unknown>>
+  will_execute: false
+}
+
+export interface SkillCandidate {
+  id: string
+  name: string
+  description: string
+  status: 'pending' | 'accepted' | 'rejected' | 'expired'
+  draft_yaml: string
+  evidence: Record<string, unknown>
+  confidence: number
+  risk_level: string
+  occurrence_count: number
+  source_task_ids: string[]
+  created_at: string
+  expires_at?: string
+  published_skill_name?: string
 }
 
 export const useSettingsStore = defineStore('settings', {
@@ -63,6 +89,9 @@ export const useSettingsStore = defineStore('settings', {
     skillDetail: null as SkillDetail | null,
     skillYaml: '',
     skillLoading: false,
+    skillCandidates: [] as SkillCandidate[],
+    skillCandidatePreviews: {} as Record<string, SkillPreview>,
+    skillCandidatesLoading: false,
     loading: false,
     saving: false,
     error: '',
@@ -164,6 +193,92 @@ export const useSettingsStore = defineStore('settings', {
         this.skillLoading = false
       }
     },
+    async loadSkillCandidates(status = 'pending') {
+      this.skillCandidatesLoading = true
+      try {
+        const result = await http.get<{ candidates: SkillCandidate[] }>('/api/skill-candidates', {
+          status,
+          page: 1,
+          page_size: 50,
+        })
+        this.skillCandidates = result.candidates ?? []
+      } catch (error) {
+        this.error = errorMessage(error)
+      } finally {
+        this.skillCandidatesLoading = false
+      }
+    },
+    async scanSkillCandidates(days = 30, minOccurrences = 3, semantic = true) {
+      const notifications = useNotificationsStore()
+      this.skillCandidatesLoading = true
+      try {
+        const result = await http.post<{
+          ok: boolean
+          scanned_tasks: number
+          repeated_groups: number
+          exact_groups: number
+          semantic_groups: number
+          semantic: { status: string }
+          created: SkillCandidate[]
+        }>('/api/skill-candidates/scan', {
+          days,
+          min_occurrences: minOccurrences,
+          semantic,
+        })
+        await this.loadSkillCandidates()
+        const mode = semantic ? '语义扫描' : '精确扫描'
+        const fallback = semantic && result.semantic?.status !== 'completed'
+          ? `；语义状态 ${result.semantic?.status ?? 'unavailable'}，精确结果仍已保留`
+          : ''
+        notifications.success(`${mode}完成：新增 ${result.created.length} 个 Skill 候选${fallback}`)
+        return result
+      } catch (error) {
+        this.error = errorMessage(error)
+        notifications.error(this.error)
+        throw error
+      } finally {
+        this.skillCandidatesLoading = false
+      }
+    },
+    async acceptSkillCandidate(candidateId: string) {
+      const notifications = useNotificationsStore()
+      this.skillCandidatesLoading = true
+      try {
+        const result = await http.post<{ ok: boolean; skill: SkillRecord }>(
+          `/api/skill-candidates/${encodeURIComponent(candidateId)}/accept`,
+        )
+        await Promise.all([this.loadSkillCandidates(), this.load()])
+        notifications.success(`已创建停用 Skill：${result.skill.name}`)
+      } catch (error) {
+        this.error = errorMessage(error)
+        notifications.error(this.error)
+        throw error
+      } finally {
+        this.skillCandidatesLoading = false
+      }
+    },
+    async rejectSkillCandidate(candidateId: string) {
+      const notifications = useNotificationsStore()
+      this.skillCandidatesLoading = true
+      try {
+        await http.post(`/api/skill-candidates/${encodeURIComponent(candidateId)}/reject`)
+        this.skillCandidates = this.skillCandidates.filter((item) => item.id !== candidateId)
+        notifications.success('Skill 候选已拒绝')
+      } catch (error) {
+        this.error = errorMessage(error)
+        notifications.error(this.error)
+        throw error
+      } finally {
+        this.skillCandidatesLoading = false
+      }
+    },
+    async previewSkillCandidate(candidateId: string) {
+      const preview = await http.post<SkillPreview & { candidate_id: string; test_input: string }>(
+        `/api/skill-candidates/${encodeURIComponent(candidateId)}/preview`,
+      )
+      this.skillCandidatePreviews[candidateId] = preview
+      return preview
+    },
     async saveSkill(name: string, yaml: string) {
       const notifications = useNotificationsStore()
       this.skillLoading = true
@@ -184,6 +299,44 @@ export const useSettingsStore = defineStore('settings', {
       } finally {
         this.skillLoading = false
       }
+    },
+    async createSkill(yaml: string) {
+      const notifications = useNotificationsStore()
+      this.skillLoading = true
+      try {
+        const result = await http.post<{ ok: boolean; skill: SkillDetail }>('/api/skills', { yaml })
+        this.skillDetail = result.skill
+        this.skillYaml = yaml
+        const skills = await http.get<{ skills: SkillRecord[] }>('/api/skills')
+        this.skills = skills.skills ?? []
+        notifications.success(`Skill ${result.skill.name} 已创建`)
+        return result.skill
+      } catch (error) {
+        this.error = errorMessage(error)
+        notifications.error(this.error)
+        throw error
+      } finally {
+        this.skillLoading = false
+      }
+    },
+    async deleteSkill(name: string) {
+      const notifications = useNotificationsStore()
+      this.skillLoading = true
+      try {
+        await http.delete<{ ok: boolean }>(`/api/skills/${encodeURIComponent(name)}`)
+        this.skills = this.skills.filter((skill) => skill.name !== name)
+        this.clearSkill()
+        notifications.success(`Skill ${name} 已删除`)
+      } catch (error) {
+        this.error = errorMessage(error)
+        notifications.error(this.error)
+        throw error
+      } finally {
+        this.skillLoading = false
+      }
+    },
+    async previewSkill(yaml: string, input: string, target = '') {
+      return http.post<SkillPreview>('/api/skills/preview', { yaml, input, target })
     },
     clearSkill() {
       this.skillDetail = null

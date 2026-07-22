@@ -77,7 +77,19 @@ async def get_task(db: aiosqlite.Connection, task_id: str) -> dict | None:
     db.row_factory = aiosqlite.Row
     cursor = await db.execute("SELECT * FROM agent_tasks WHERE id = ?", (task_id,))
     row = await cursor.fetchone()
-    return dict(row) if row else None
+    return _task_row(row) if row else None
+
+
+def _task_row(row) -> dict:
+    item = dict(row)
+    snapshot = item.get("workflow_snapshot")
+    if isinstance(snapshot, str) and snapshot:
+        try:
+            decoded = json.loads(snapshot)
+            item["workflow_snapshot"] = decoded if isinstance(decoded, dict) else None
+        except ValueError:
+            item["workflow_snapshot"] = None
+    return item
 
 
 async def claim_task_confirmation(
@@ -108,7 +120,7 @@ async def claim_task_confirmation(
         (task_id, session_id, channel),
     )
     row = await task_cursor.fetchone()
-    return cursor.rowcount == 1, dict(row) if row else None
+    return cursor.rowcount == 1, _task_row(row) if row else None
 
 
 async def get_session_tasks(
@@ -129,7 +141,7 @@ async def get_session_tasks(
     sql += " ORDER BY updated_at DESC"
     db.row_factory = aiosqlite.Row
     cursor = await db.execute(sql, params)
-    return [dict(row) for row in await cursor.fetchall()]
+    return [_task_row(row) for row in await cursor.fetchall()]
 
 
 async def get_active_tasks(
@@ -151,7 +163,7 @@ async def get_active_tasks(
     sql += " ORDER BY updated_at DESC"
     db.row_factory = aiosqlite.Row
     cursor = await db.execute(sql, params)
-    return [dict(row) for row in await cursor.fetchall()]
+    return [_task_row(row) for row in await cursor.fetchall()]
 
 
 async def reconcile_orphaned_tasks(
@@ -223,6 +235,7 @@ async def update_task(
     pending_command: str | None = None,
     pending_target: str | None = None,
     confirm_mode: str | None = None,
+    workflow_snapshot: dict | None = None,
     completed: bool = False,
 ) -> dict | None:
     assignments = ["updated_at = ?"]
@@ -246,6 +259,9 @@ async def update_task(
     if confirm_mode is not None:
         assignments.append("confirm_mode = ?")
         params.append(confirm_mode)
+    if workflow_snapshot is not None:
+        assignments.append("workflow_snapshot = ?")
+        params.append(json.dumps(workflow_snapshot, ensure_ascii=False, sort_keys=True))
     if completed:
         assignments.append("completed_at = ?")
         params.append(now)

@@ -1,3 +1,5 @@
+import shlex
+
 import pytest
 
 from shell_agent.core.models import AgentRequest, InputType
@@ -8,7 +10,7 @@ from shell_agent.executors.ssh import (
     truncate_output,
 )
 from shell_agent.llm.adapter import LLMAdapter
-from shell_agent.utils.config import Credential, LLMConfig, ServerEntry
+from shell_agent.utils.config import Credential, LLMConfig, ServerEntry, SSHConfig
 
 
 def test_parse_ssh_command_with_quotes() -> None:
@@ -20,6 +22,10 @@ def test_parse_ssh_command_with_quotes() -> None:
         "prod-order-01",
         "tail -n 100 /var/log/app.log",
     )
+    quoted = "grep 'error' /var/log/app.log"
+    assert parse_ssh_command(
+        f"ssh prod-order-01 {shlex.quote(quoted)}"
+    ) == ("prod-order-01", quoted)
 
 
 def test_parse_ssh_command_without_quotes() -> None:
@@ -85,6 +91,10 @@ def test_ssh_executor_can_trust_unknown_hosts() -> None:
     )
 
     assert executor.trust_unknown_hosts is True
+
+
+def test_ssh_config_trusts_unknown_hosts_by_default() -> None:
+    assert SSHConfig().trust_unknown_hosts is True
 
 
 @pytest.mark.asyncio

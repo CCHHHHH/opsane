@@ -196,7 +196,7 @@ describe('protocol consumers', () => {
     chat.setSession('chat-confirm-once')
     chat.consume({
       type: 'command_preview', session_id: 'chat-confirm-once', turn_id: 'task-confirm', channel: 'chat',
-      task_id: 'task-confirm', command: 'systemctl restart app', target: 'dev-1', cwd: '',
+      task_id: 'task-confirm', operation_id: 'cmd-confirm', command: 'systemctl restart app', target: 'dev-1', cwd: '',
       intent: '重启服务', explanation: '', confirm_mode: 'auto_safe', risk_level: 'caution',
       risk_reasons: [], risk_rules: [], policy_blocked: false, policy_block_reason: '',
       requires_secondary_confirm: false, secondary_confirm_expected: '', secondary_confirm_label: '',
@@ -209,7 +209,7 @@ describe('protocol consumers', () => {
     expect(chat.confirmationSubmitting).toBe(true)
     expect(send).toHaveBeenCalledTimes(1)
     expect(send).toHaveBeenCalledWith(expect.objectContaining({
-      type: 'confirm', task_id: 'task-confirm', operation_id: 'task-confirm', confirmed,
+      type: 'confirm', task_id: 'task-confirm', operation_id: 'cmd-confirm', confirmed,
       request_id: expect.stringMatching(/^confirm-/),
     }))
     send.mockRestore()

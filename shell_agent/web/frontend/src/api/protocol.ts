@@ -244,6 +244,9 @@ export interface TextServerEvent extends ServerBaseEvent {
 export interface CommandPreviewEvent extends ServerBaseEvent {
   type: 'command_preview'
   task_id: string
+  operation_id?: string
+  step_index?: number
+  total_steps?: number
   command: string
   target: string
   cwd: string
@@ -497,6 +500,34 @@ export function pendingCommandEvent(
     secondary_confirm_expected: stringValue(pending.secondary_confirm_expected),
     secondary_confirm_reason: stringValue(pending.secondary_confirm_reason),
   }
+}
+
+/** Match the one concrete command that is currently waiting for confirmation. */
+export function commandPreviewsMatch(
+  candidate: CommandPreviewEvent,
+  pending: CommandPreviewEvent,
+): boolean {
+  if (candidate.task_id !== pending.task_id) return false
+
+  const candidateOperationId = stringValue(candidate.operation_id)
+  const pendingOperationId = stringValue(pending.operation_id)
+  if (candidateOperationId || pendingOperationId) {
+    return Boolean(
+      candidateOperationId
+      && pendingOperationId
+      && candidateOperationId === pendingOperationId
+    )
+  }
+
+  const candidateStep = Number(candidate.step_index)
+  const pendingStep = Number(pending.step_index)
+  if (candidateStep > 0 || pendingStep > 0) {
+    return candidateStep > 0 && pendingStep > 0 && candidateStep === pendingStep
+  }
+
+  return candidate.command === pending.command
+    && candidate.target === pending.target
+    && candidate.cwd === pending.cwd
 }
 
 /** Restore an actionable conversational SFTP preview from session_sync. */

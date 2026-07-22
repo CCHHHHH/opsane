@@ -101,6 +101,17 @@ class SkillYamlUpdate(BaseModel):
     yaml: str
 
 
+class SkillPreviewRequest(SkillYamlUpdate):
+    input: str
+    target: str = ""
+
+
+class SkillCandidateScanRequest(BaseModel):
+    days: int = Field(default=30, ge=1, le=365)
+    min_occurrences: int = Field(default=3, ge=2, le=20)
+    semantic: bool = True
+
+
 class MemoryCreate(BaseModel):
     subject: str
     predicate: str = "note"

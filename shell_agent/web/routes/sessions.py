@@ -1,14 +1,17 @@
 """Session lifecycle and persisted-session state REST endpoints."""
 from __future__ import annotations
 
+import json
 from pathlib import Path
 import re
+import shlex
 
 from fastapi import APIRouter, HTTPException
 
 from shell_agent.core.context import SessionContext
-from shell_agent.core.models import PendingCommand
+from shell_agent.core.models import ConfirmMode, PendingCommand
 from shell_agent.safety.classifier import classify_command
+from shell_agent.safety.policy import evaluate_environment_policy
 from shell_agent.storage.sessions import (
     create_session,
     get_session,
@@ -24,6 +27,7 @@ from shell_agent.storage.file_transfers import (
 )
 from shell_agent.web.routes.file_transfers import _public_transfer
 from shell_agent.storage.tasks import (
+    get_task,
     get_task_events,
     get_session_tasks,
     update_task,
@@ -55,6 +59,14 @@ def _display_command(command: PendingCommand) -> str:
     return command.display_command or command.actual_command
 
 
+def _task_total_steps(command: PendingCommand) -> int:
+    if command.max_steps > 0:
+        return max(command.max_steps, command.step_index)
+    if command.step_queue:
+        return max(command.step_index + len(command.step_queue), command.step_index)
+    return 0
+
+
 def _command_preview_payload(
     rt,
     session_id: str,
@@ -66,8 +78,11 @@ def _command_preview_payload(
     return {
         "session_id": session_id,
         "task_id": command.task_id,
+        "operation_id": command.id,
         "turn_id": command.task_id if channel == "chat" else "",
         "channel": channel,
+        "step_index": command.step_index,
+        "total_steps": _task_total_steps(command),
         "command": _display_command(command),
         "target": command.target,
         "cwd": context.get_cwd(command.target),
@@ -103,10 +118,122 @@ def _operation_plan_payload(plan: dict, active: bool = False) -> dict:
     }
 
 
-def _session_pending_state(rt, session_id: str) -> dict:
+def _decode_workflow_snapshot(value) -> dict:
+    if isinstance(value, dict):
+        return value
+    if not value:
+        return {}
+    try:
+        decoded = json.loads(value)
+    except (TypeError, ValueError):
+        return {}
+    return decoded if isinstance(decoded, dict) else {}
+
+
+async def _restore_pending_command_from_task(
+    rt,
+    session_id: str,
+    channel: str,
+    task_id: str = "",
+) -> PendingCommand | None:
+    if not task_id or not getattr(rt, "db", None) or not getattr(rt, "executor", None):
+        return None
+    task = await get_task(rt.db, task_id)
+    if (
+        not task
+        or task.get("session_id") != session_id
+        or task.get("channel") != channel
+        or task.get("status") != "waiting_confirm"
+        or not task.get("pending_command")
+        or not task.get("pending_target")
+    ):
+        return None
+    try:
+        command = rt.executor.normalize(
+            f"ssh {task['pending_target']} {shlex.quote(task['pending_command'])}"
+        )
+    except ValueError:
+        return None
+    snapshot = _decode_workflow_snapshot(task.get("workflow_snapshot"))
+    command.id = str(snapshot.get("operation_id") or command.id)
+    command.source = str(snapshot.get("source") or "llm")
+    command.user_input = str(snapshot.get("user_input") or task.get("title") or "")
+    command.intent = str(snapshot.get("intent") or task.get("title") or "")
+    command.explanation = str(snapshot.get("explanation") or "")
+    command.response_mode = str(snapshot.get("response_mode") or command.response_mode)
+    command.step_index = int(snapshot.get("step_index") or command.step_index)
+    command.max_steps = int(snapshot.get("max_steps") or command.max_steps)
+    queue = snapshot.get("step_queue")
+    command.step_queue = queue if isinstance(queue, list) else []
+    command.skill_name = str(snapshot.get("skill_name") or "")
+    command.skill_version = str(snapshot.get("skill_version") or "")
+    command.skill_hash = str(snapshot.get("skill_hash") or "")
+    command.skill_default_confirm_mode = str(
+        snapshot.get("skill_default_confirm_mode") or "interactive"
+    )
+    command.skill_force_confirm = bool(snapshot.get("skill_force_confirm", False))
+    command.skill_on_failure = str(snapshot.get("skill_on_failure") or "abort")
+    command.skill_had_failures = bool(snapshot.get("skill_had_failures", False))
+    command.step_name = str(snapshot.get("step_name") or "")
+    timeout = snapshot.get("timeout_seconds")
+    command.timeout_seconds = int(timeout) if timeout is not None else None
+    current_policy = evaluate_environment_policy(
+        env=command.target_env,
+        target=command.target,
+        executor=command.executor,
+        risk=classify_command(command.actual_command),
+    )
+    command.policy_blocked = bool(snapshot.get("policy_blocked", False)) or current_policy.blocked
+    command.policy_block_reason = str(
+        snapshot.get("policy_block_reason") or current_policy.block_reason or ""
+    )
+    command.requires_secondary_confirm = (
+        bool(snapshot.get("requires_secondary_confirm", False))
+        or current_policy.requires_secondary_confirm
+    )
+    command.secondary_confirm_expected = str(
+        snapshot.get("secondary_confirm_expected")
+        or current_policy.secondary_confirm_expected
+        or ""
+    )
+    command.secondary_confirm_label = str(
+        snapshot.get("secondary_confirm_label")
+        or current_policy.secondary_confirm_label
+        or ""
+    )
+    command.secondary_confirm_reason = str(
+        snapshot.get("secondary_confirm_reason")
+        or current_policy.secondary_confirm_reason
+        or ""
+    )
+    command.confirm_mode = task.get("confirm_mode") or ConfirmMode.INTERACTIVE.value
+    command.task_id = task["id"]
+    return command
+
+
+async def _session_pending_state(rt, session_id: str) -> dict:
     pending: dict[str, dict] = {}
     for channel in ("chat", "command"):
         command = getattr(rt, "pending_commands", {}).get(_pending_key(session_id, channel))
+        if not command and getattr(rt, "db", None):
+            tasks = await get_session_tasks(
+                rt.db, session_id, channel=channel, include_completed=False
+            )
+            waiting = next(
+                (
+                    task
+                    for task in tasks
+                    if task.get("status") == "waiting_confirm"
+                    and task.get("pending_command")
+                ),
+                None,
+            )
+            if waiting:
+                command = await _restore_pending_command_from_task(
+                    rt, session_id, channel, str(waiting.get("id") or "")
+                )
+                if command:
+                    rt.pending_commands[_pending_key(session_id, channel)] = command
         if command:
             pending[channel] = _command_preview_payload(rt, session_id, command, channel)
     plan = getattr(rt, "pending_operation_plans", {}).get(_pending_plan_key(session_id))
@@ -153,7 +280,7 @@ async def api_get_session(session_id: str, message_limit: int = 0) -> dict:
     session = await get_session(rt.db, session_id, message_limit=safe_limit or None)
     if not session:
         return {"error": f"会话 {session_id} 不存在"}
-    session["pending"] = _session_pending_state(rt, session_id)
+    session["pending"] = await _session_pending_state(rt, session_id)
     waiting_transfer = await get_waiting_file_transfer(rt.db, session_id)
     if waiting_transfer:
         session["pending"]["file_transfer"] = _public_transfer(waiting_transfer)

@@ -37,8 +37,8 @@ def create_app(config_path: str = "config/agent.yaml") -> FastAPI:
     # CORS（开发时允许前端跨域）
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=["*"],
-        allow_credentials=True,
+        allow_origin_regex=r"^https?://(?:127\.0\.0\.1|localhost)(?::\d+)?$",
+        allow_credentials=False,
         allow_methods=["*"],
         allow_headers=["*"],
     )

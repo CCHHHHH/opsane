@@ -34,6 +34,7 @@ async def query_audit(
     db: aiosqlite.Connection,
     target: str | None = None,
     limit: int = 50,
+    offset: int = 0,
 ) -> list[dict]:
     """查询审计记录"""
     sql = "SELECT * FROM audit_logs"
@@ -41,9 +42,24 @@ async def query_audit(
     if target:
         sql += " WHERE target = ?"
         params.append(target)
-    sql += " ORDER BY timestamp DESC LIMIT ?"
-    params.append(limit)
+    sql += " ORDER BY timestamp DESC LIMIT ? OFFSET ?"
+    params.extend([max(1, limit), max(0, offset)])
     db.row_factory = aiosqlite.Row
     cursor = await db.execute(sql, params)
     rows = await cursor.fetchall()
     return [dict(row) for row in rows]
+
+
+async def count_audit(
+    db: aiosqlite.Connection,
+    target: str | None = None,
+) -> int:
+    """Count audit records using the same target filter as ``query_audit``."""
+    sql = "SELECT COUNT(*) FROM audit_logs"
+    params: list = []
+    if target:
+        sql += " WHERE target = ?"
+        params.append(target)
+    cursor = await db.execute(sql, params)
+    row = await cursor.fetchone()
+    return int(row[0] or 0) if row else 0

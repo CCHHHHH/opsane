@@ -20,6 +20,7 @@ from shell_agent.llm.prompts import (
     NEXT_STEP_PROMPT_TEMPLATE,
     OPERATION_PLAN_REVISION_TEMPLATE,
     OPERATION_PLAN_STEPS_TEMPLATE,
+    SKILL_FLOW_CLUSTERING_PROMPT_TEMPLATE,
     SYSTEM_PROMPT,
     USER_PROMPT_TEMPLATE,
 )
@@ -293,6 +294,38 @@ class LLMAdapter:
             timeout=self.config.timeout,
         )
         return (response.choices[0].message.content or "").strip()
+
+    async def cluster_skill_flows(
+        self,
+        flows: list[dict[str, Any]],
+        *,
+        min_occurrences: int = 3,
+    ) -> dict | str:
+        """Group redacted successful task summaries by reusable intent.
+
+        The model is deliberately limited to returning task-id groups. Command
+        templates and Skill YAML are compiled and validated locally.
+        """
+        model = self.config.summary_model or self.config.model
+        prompt = SKILL_FLOW_CLUSTERING_PROMPT_TEMPLATE.format(
+            flows_json=json.dumps(flows, ensure_ascii=False, indent=2),
+            min_occurrences=max(2, min(int(min_occurrences), 20)),
+        )
+        logger.info(f"LLM 历史 Skill 语义分组: model={model} flows={len(flows)}")
+        response = await self._get_client().chat.completions.create(
+            model=model,
+            messages=[
+                {
+                    "role": "system",
+                    "content": "你只负责对脱敏后的成功任务 ID 分组，不能生成命令或 Skill。",
+                },
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.1,
+            max_tokens=min(self.config.max_tokens, 3000),
+            timeout=self.config.timeout,
+        )
+        return self._parse_json_response(response.choices[0].message.content or "")
 
     async def revise_operation_plan(
         self,

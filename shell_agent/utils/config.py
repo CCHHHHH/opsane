@@ -28,7 +28,7 @@ class SSHConfig(BaseModel):
     idle_timeout: int = 300
     total_max: int = 50
     default_timeout: int = 60
-    trust_unknown_hosts: bool = False
+    trust_unknown_hosts: bool = True
 
 
 class StorageConfig(BaseModel):

@@ -97,11 +97,6 @@ def truncate_output(text: str, limit: int = 10000) -> tuple[str, bool]:
     return f"{head}\n\n... [{skipped} chars truncated] ...\n\n{tail}", True
 
 
-# 解析 "ssh <alias> '<command>'" 或 "ssh <alias> \"<command>\""
-_SSH_PATTERN = re.compile(
-    r"""^\s*ssh\s+(?P<target>\S+)\s+(?P<quote>['"])(?P<cmd>.*)(?P=quote)\s*$""",
-    re.DOTALL,
-)
 _COMMON_SHELL_ALIASES = {
     "ll": "ls -l",
     "la": "ls -la",
@@ -115,11 +110,10 @@ _COMMON_ALIAS_PATTERN = re.compile(
 
 def parse_ssh_command(raw: str) -> tuple[str, str] | None:
     """从 'ssh alias "command"' 解析出 (target, command)"""
-    m = _SSH_PATTERN.match(raw)
-    if m:
-        return m.group("target"), m.group("cmd")
-    # 退而求其次：ssh alias command（无引号）
-    parts = shlex.split(raw, posix=True)
+    try:
+        parts = shlex.split(raw, posix=True)
+    except ValueError:
+        return None
     if len(parts) >= 3 and parts[0] == "ssh":
         return parts[1], " ".join(parts[2:])
     return None

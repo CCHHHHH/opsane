@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 
-import type { CommandPreviewEvent, ConfirmMode, ServerEvent } from '../api/protocol'
+import { commandPreviewsMatch, type CommandPreviewEvent, type ConfirmMode, type ServerEvent } from '../api/protocol'
 import { errorMessage } from '../api/http'
 import DeploymentRunCard from '../components/chat/DeploymentRunCard.vue'
 import ExecutionStep from '../components/chat/ExecutionStep.vue'
@@ -122,9 +122,8 @@ const connectionLabel = computed(() => ({
 }[chat.connectionState]))
 
 function isPreviewActionable(event: ServerEvent): boolean {
-  return event.type === 'command_preview'
-    && Boolean(chat.pendingPreview)
-    && event.task_id === chat.pendingPreview?.task_id
+  if (event.type !== 'command_preview' || !chat.pendingPreview) return false
+  return commandPreviewsMatch(event as CommandPreviewEvent, chat.pendingPreview)
 }
 
 function isPlanActionable(event: ServerEvent): boolean {

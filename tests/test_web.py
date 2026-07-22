@@ -2,27 +2,35 @@ from pathlib import Path
 import asyncio
 import json
 import sqlite3
+from types import SimpleNamespace
 
 import pytest
 import yaml
 from fastapi.testclient import TestClient
+from starlette.websockets import WebSocketDisconnect
 
 from shell_agent.core.models import ExecutionResult, PendingCommand
 from shell_agent.web.api import (
+    _effective_skill_confirm_mode,
+    _execute,
     _handle_chat_message,
     _handle_cancel,
     _handle_confirm,
     _handle_completion,
     _handle_direct_command,
     _preview_and_apply_policy,
+    _maybe_plan_next_step,
+    _maybe_analyze_execution_result,
+    _restore_pending_command_from_task,
     _session_pending_state,
 )
 from shell_agent.web.app import create_app
 from shell_agent.web.runtime import get_runtime
 from shell_agent.executors.ssh import parse_ssh_command
 from shell_agent.storage.database import connect, init_db
-from shell_agent.storage.sessions import ensure_session
-from shell_agent.storage.tasks import create_task, get_session_tasks, get_task, update_task
+from shell_agent.storage.sessions import ensure_session, get_session
+from shell_agent.storage.tasks import add_task_event, create_task, get_session_tasks, get_task, update_task
+from shell_agent.storage.skill_candidates import create_skill_candidate
 
 
 def _write_runtime_files(root: Path) -> Path:
@@ -71,6 +79,26 @@ def test_root_redirects_to_vue_workbench(tmp_path, monkeypatch) -> None:
     assert response.status_code == 307
     assert response.headers["location"] == "/next/#/chat"
     assert response.headers["cache-control"] == "no-store"
+
+
+def test_cross_origin_http_and_websocket_are_not_trusted(tmp_path, monkeypatch) -> None:
+    agent_path = _write_runtime_files(tmp_path)
+    monkeypatch.chdir(tmp_path)
+
+    with TestClient(create_app(str(agent_path))) as client:
+        response = client.get(
+            "/api/state",
+            headers={"Origin": "https://evil.example"},
+        )
+        assert "access-control-allow-origin" not in response.headers
+        with pytest.raises(WebSocketDisconnect) as rejected:
+            with client.websocket_connect(
+                "/ws/chat",
+                headers={"Origin": "https://evil.example"},
+            ):
+                pass
+
+    assert rejected.value.code == 1008
 
 
 def test_modular_state_memory_and_audit_routes_preserve_protocol(tmp_path, monkeypatch) -> None:
@@ -126,6 +154,113 @@ def test_config_endpoint_updates_ssh_trust_unknown_hosts(tmp_path, monkeypatch) 
 
         config_response = client.get("/api/config")
         assert config_response.json()["ssh"]["trust_unknown_hosts"] is True
+
+
+def test_server_connection_probe_does_not_persist_inventory(
+    tmp_path, monkeypatch
+) -> None:
+    agent_path = _write_runtime_files(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    captured = {}
+
+    async def fake_probe(runtime, server):
+        captured["runtime"] = runtime
+        captured["server"] = server
+        return {
+            "ok": True,
+            "message": "SSH 连接成功（12 ms）",
+            "latency_ms": 12,
+        }
+
+    monkeypatch.setattr(
+        "shell_agent.web.routes.inventory._probe_server_connection",
+        fake_probe,
+    )
+
+    with TestClient(create_app(str(agent_path))) as client:
+        response = client.post(
+            "/api/servers/test-connection",
+            json={
+                "alias": "dev-01",
+                "host": "10.0.0.12",
+                "port": 22,
+                "env": "dev",
+                "role": "app",
+                "ssh_credential": "dev-01-ssh",
+                "tags": ["iot"],
+            },
+        )
+
+        assert response.status_code == 200
+        assert response.json() == {
+            "ok": True,
+            "message": "SSH 连接成功（12 ms）",
+            "latency_ms": 12,
+        }
+        assert captured["runtime"] is get_runtime()
+        assert captured["server"].alias == "dev-01"
+        assert client.get("/api/servers").json() == {"servers": []}
+
+    saved = yaml.safe_load((tmp_path / "config" / "inventory.yaml").read_text())
+    assert saved == {"servers": []}
+
+
+@pytest.mark.asyncio
+async def test_server_connection_probe_uses_runtime_ssh_policy(monkeypatch) -> None:
+    from shell_agent.web.routes.inventory import (
+        SERVER_CONNECTION_TEST_MARKER,
+        _probe_server_connection,
+    )
+    from shell_agent.web.schemas import ServerCreate
+
+    captured = {}
+
+    class FakeExecutor:
+        def __init__(self, **kwargs):
+            captured["executor"] = kwargs
+
+        async def execute(self, command, timeout):
+            captured["command"] = command
+            captured["timeout"] = timeout
+            return ExecutionResult(
+                exit_code=0,
+                stdout=SERVER_CONNECTION_TEST_MARKER,
+                stderr="",
+                duration_ms=8,
+            )
+
+        async def close_all(self):
+            captured["closed"] = True
+
+    monkeypatch.setattr(
+        "shell_agent.web.routes.inventory.SSHExecutor",
+        FakeExecutor,
+    )
+    runtime = SimpleNamespace(
+        credentials={"dev-01-ssh": object()},
+        config=SimpleNamespace(
+            ssh=SimpleNamespace(
+                default_timeout=60,
+                idle_timeout=300,
+                trust_unknown_hosts=True,
+            )
+        ),
+    )
+
+    result = await _probe_server_connection(
+        runtime,
+        ServerCreate(
+            alias="dev-01",
+            host="10.0.0.12",
+            ssh_credential="dev-01-ssh",
+        ),
+    )
+
+    assert result["ok"] is True
+    assert captured["executor"]["trust_unknown_hosts"] is True
+    assert captured["command"].actual_command == f"printf {SERVER_CONNECTION_TEST_MARKER}"
+    assert captured["timeout"] == 12
+    assert captured["closed"] is True
 
 
 def test_services_api_crud_persists_service_profiles(tmp_path, monkeypatch) -> None:
@@ -203,6 +338,42 @@ def test_services_api_crud_persists_service_profiles(tmp_path, monkeypatch) -> N
         assert delete_response.status_code == 200
         assert delete_response.json() == {"ok": True}
         assert client.get("/api/services").json()["services"] == []
+
+
+def test_server_rename_updates_service_references_and_delete_blocks_dangling_refs(
+    tmp_path, monkeypatch
+) -> None:
+    agent_path = _write_runtime_files(tmp_path)
+    monkeypatch.chdir(tmp_path)
+
+    with TestClient(create_app(str(agent_path))) as client:
+        server = {
+            "alias": "dev-01",
+            "host": "10.0.0.1",
+            "env": "dev",
+            "ssh_credential": "ssh-dev",
+        }
+        assert client.post("/api/servers", json=server).json()["ok"] is True
+        service = client.post(
+            "/api/services",
+            json={"id": "app", "name": "App", "servers": ["dev-01"]},
+        ).json()["service"]
+
+        renamed = client.put(
+            "/api/servers/dev-01",
+            json={**server, "alias": "dev-main"},
+        )
+        assert renamed.json()["ok"] is True
+        updated_service = client.get("/api/services").json()["services"][0]
+        assert updated_service["servers"] == ["dev-main"]
+        assert updated_service["revision"] == service["revision"] + 1
+
+        blocked = client.delete("/api/servers/dev-main")
+        assert blocked.json()["ok"] is False
+        assert "App" in blocked.json()["error"]
+        assert [item["alias"] for item in client.get("/api/servers").json()["servers"]] == [
+            "dev-main"
+        ]
 
 
 def test_safety_config_api_reads_defaults_and_saves_audited_config(tmp_path, monkeypatch) -> None:
@@ -301,6 +472,90 @@ def test_skills_api_lists_template_skills(tmp_path, monkeypatch) -> None:
     assert response.status_code == 200
     names = {skill["name"] for skill in response.json()["skills"]}
     assert {"resource_summary", "java_processes", "list_directory"} <= names
+
+
+def test_skill_preview_renders_without_persisting_or_executing(tmp_path, monkeypatch) -> None:
+    agent_path = _write_runtime_files(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    skill_yaml = yaml.safe_dump(
+        {
+            "name": "preview_only",
+            "version": "1",
+            "triggers": ["测试 Skill"],
+            "steps": [
+                {
+                    "name": "只读预览",
+                    "command": "uptime",
+                    "confirm": True,
+                    "timeout_seconds": 20,
+                    "on_failure": "abort",
+                }
+            ],
+        },
+        allow_unicode=True,
+        sort_keys=False,
+    )
+
+    with TestClient(create_app(str(agent_path))) as client:
+        response = client.post(
+            "/api/skills/preview",
+            json={"yaml": skill_yaml, "input": "请测试 Skill"},
+        )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["ok"] is True
+    assert payload["will_execute"] is False
+    assert payload["steps"][0]["command"] == "uptime"
+    assert payload["steps"][0]["risk_level"] == "safe"
+    assert not (tmp_path / "skills" / "templates" / "preview_only.yaml").exists()
+
+
+@pytest.mark.asyncio
+async def test_accept_skill_candidate_creates_disabled_skill_once(tmp_path, monkeypatch) -> None:
+    agent_path = _write_runtime_files(tmp_path)
+    db_path = tmp_path / "data" / "shell_agent.db"
+    await init_db(str(db_path))
+    db = await connect(str(db_path))
+    candidate, _ = await create_skill_candidate(
+        db,
+        name="learned_accept",
+        description="候选",
+        fingerprint="accept-fingerprint",
+        draft_yaml=yaml.safe_dump(
+            {
+                "name": "learned_accept",
+                "enabled": True,
+                "triggers": ["检查测试"],
+                "steps": [{"command": "uptime", "confirm": True}],
+            },
+            allow_unicode=True,
+            sort_keys=False,
+        ),
+        evidence={"occurrences": 3},
+        confidence=0.8,
+        risk_level="safe",
+        source_task_ids=["task-1", "task-2", "task-3"],
+    )
+    await db.close()
+    monkeypatch.chdir(tmp_path)
+
+    with TestClient(create_app(str(agent_path))) as client:
+        preview = client.post(f"/api/skill-candidates/{candidate['id']}/preview")
+        first = client.post(f"/api/skill-candidates/{candidate['id']}/accept")
+        second = client.post(f"/api/skill-candidates/{candidate['id']}/accept")
+
+    assert preview.status_code == 200
+    assert preview.json()["will_execute"] is False
+    assert preview.json()["steps"][0]["command"] == "uptime"
+    assert first.status_code == 200
+    assert first.json()["ok"] is True
+    assert first.json()["skill"]["enabled"] is False
+    saved = yaml.safe_load(
+        (tmp_path / "skills" / "templates" / "learned_accept.yaml").read_text(encoding="utf-8")
+    )
+    assert saved["enabled"] is False
+    assert second.json()["ok"] is False
 
 
 def test_sessions_api_create_list_get_delete(tmp_path, monkeypatch) -> None:
@@ -555,6 +810,37 @@ def test_credentials_api_masks_and_updates_values(tmp_path, monkeypatch) -> None
         assert client.get("/api/credentials").json()["credentials"] == []
 
 
+def test_credential_delete_blocks_server_reference(tmp_path, monkeypatch) -> None:
+    agent_path = _write_runtime_files(tmp_path)
+    monkeypatch.chdir(tmp_path)
+
+    with TestClient(create_app(str(agent_path))) as client:
+        assert client.post(
+            "/api/credentials",
+            json={
+                "id": "deploy",
+                "type": "password",
+                "username": "ops",
+                "password": "secret",
+            },
+        ).json()["ok"] is True
+        assert client.post(
+            "/api/servers",
+            json={
+                "alias": "dev-01",
+                "host": "10.0.0.1",
+                "env": "dev",
+                "ssh_credential": "deploy",
+            },
+        ).json()["ok"] is True
+
+        blocked = client.delete("/api/credentials/deploy")
+
+        assert blocked.json()["ok"] is False
+        assert "dev-01" in blocked.json()["error"]
+        assert client.get("/api/credentials").json()["credentials"][0]["id"] == "deploy"
+
+
 class FakeWebSocket:
     def __init__(self) -> None:
         self.messages = []
@@ -648,6 +934,281 @@ class FakeRuntime:
         self.audit_records = []
         self.servers = {"unit-host": object()}
         self.llm = None
+
+
+@pytest.mark.asyncio
+async def test_chat_can_scan_history_and_create_skill_candidate(tmp_path) -> None:
+    db_path = tmp_path / "shell_agent.db"
+    await init_db(str(db_path))
+    db = await connect(str(db_path))
+    runtime = FakeRuntime()
+    runtime.db = db
+    websocket = FakeWebSocket()
+    try:
+        for index in range(1, 4):
+            historical_session = f"sess_history_{index}"
+            await ensure_session(db, historical_session, session_type="chat", title="检查运行时间")
+            task = await create_task(db, historical_session, "chat", title="检查运行时间")
+            await update_task(db, task["id"], status="completed", completed=True)
+            await add_task_event(
+                db,
+                task["id"],
+                historical_session,
+                "chat",
+                "execution_result",
+                status="success",
+                step_index=1,
+                content="up",
+                payload={
+                    "command": f"ssh dev-0{index} 'uptime'",
+                    "target": f"dev-0{index}",
+                    "exit_code": 0,
+                    "output": "up",
+                },
+            )
+
+        await _handle_chat_message(
+            websocket,
+            runtime,
+            "sess_scan_request",
+            "扫描最近 30 天历史会话，总结可以沉淀成 Skill 的流程",
+            confirm_mode="interactive",
+        )
+
+        agent_messages = [
+            item for item in websocket.messages if item.get("type") == "agent"
+        ]
+        assert agent_messages
+        assert "Skill 候选扫描完成" in agent_messages[-1]["content"]
+        assert "新建候选：1 个" in agent_messages[-1]["content"]
+        assert runtime.executor.execute_calls == 0
+    finally:
+        await db.close()
+
+
+def test_skill_confirmation_policy_only_tightens_user_mode() -> None:
+    command = PendingCommand(
+        raw="ssh unit-host uptime",
+        target="unit-host",
+        target_env="test",
+        executor="ssh",
+        actual_command="uptime",
+        source="skill",
+        skill_name="resource_summary",
+        skill_default_confirm_mode="auto_safe",
+    )
+
+    assert _effective_skill_confirm_mode(command, "full_access") == "auto_safe"
+    assert _effective_skill_confirm_mode(command, "interactive") == "interactive"
+    command.skill_force_confirm = True
+    assert _effective_skill_confirm_mode(command, "full_access") == "interactive"
+
+
+@pytest.mark.asyncio
+async def test_skill_next_step_stays_deterministic_skill_without_llm() -> None:
+    runtime = FakeRuntime()
+    websocket = FakeWebSocket()
+    command = PendingCommand(
+        raw="ssh unit-host uptime",
+        target="unit-host",
+        target_env="test",
+        executor="ssh",
+        actual_command="uptime",
+        source="skill",
+        user_input="检查资源",
+        response_mode="workflow",
+        step_index=1,
+        max_steps=2,
+        skill_name="resource_summary",
+        skill_version="2",
+        skill_hash="hash-v2",
+        skill_default_confirm_mode="auto_safe",
+        step_queue=[{
+            "command": "ssh unit-host 'df -h'",
+            "intent": "检查磁盘",
+            "skill_step_name": "磁盘",
+            "confirm": False,
+            "timeout_seconds": 23,
+            "on_failure": "abort",
+            "skill_name": "resource_summary",
+            "skill_version": "2",
+            "skill_hash": "hash-v2",
+            "skill_default_confirm_mode": "auto_safe",
+        }],
+    )
+
+    await _maybe_plan_next_step(
+        websocket,
+        runtime,
+        "sess_skill_next",
+        command,
+        "第一步成功",
+        "interactive",
+    )
+
+    pending = runtime.pending_commands["sess_skill_next:chat"]
+    assert pending.source == "skill"
+    assert pending.skill_name == "resource_summary"
+    assert pending.skill_version == "2"
+    assert pending.timeout_seconds == 23
+    assert pending.step_queue == []
+
+
+@pytest.mark.asyncio
+async def test_skill_abort_policy_stops_after_failed_step() -> None:
+    runtime = FakeRuntime()
+    websocket = FakeWebSocket()
+    command = PendingCommand(
+        raw="ssh unit-host false",
+        target="unit-host",
+        target_env="test",
+        executor="ssh",
+        actual_command="false",
+        source="skill",
+        user_input="运行检查",
+        response_mode="workflow",
+        skill_name="failure_test",
+        skill_on_failure="abort",
+        step_queue=[{"command": "ssh unit-host uptime"}],
+    )
+
+    owned = await _maybe_analyze_execution_result(
+        websocket,
+        runtime,
+        "sess_skill_abort",
+        command,
+        ExecutionResult(exit_code=1, stdout="", stderr="failed", duration_ms=1),
+        "chat",
+    )
+
+    assert owned is True
+    assert "sess_skill_abort:chat" not in runtime.pending_commands
+    assert any(
+        message.get("type") == "system" and "已停止后续步骤" in message.get("content", "")
+        for message in websocket.messages
+    )
+
+
+@pytest.mark.asyncio
+async def test_skill_continue_policy_reports_partial_when_last_step_fails() -> None:
+    runtime = FakeRuntime()
+    websocket = FakeWebSocket()
+    command = PendingCommand(
+        raw="ssh unit-host false",
+        target="unit-host",
+        target_env="test",
+        executor="ssh",
+        actual_command="false",
+        source="skill",
+        user_input="运行检查",
+        response_mode="workflow",
+        task_id="task_skill_partial",
+        max_steps=1,
+        skill_name="failure_test",
+        skill_on_failure="continue",
+    )
+
+    owned = await _maybe_analyze_execution_result(
+        websocket,
+        runtime,
+        "sess_skill_partial",
+        command,
+        ExecutionResult(exit_code=1, stdout="", stderr="failed", duration_ms=1),
+        "chat",
+    )
+
+    assert owned is True
+    assert command.skill_had_failures is True
+    assert any(
+        message.get("type") == "task_step"
+        and "部分完成" in message.get("content", "")
+        for message in websocket.messages
+    )
+    assert any(
+        message.get("type") == "turn_state"
+        and message.get("label") == "任务部分完成"
+        for message in websocket.messages
+    )
+
+
+@pytest.mark.asyncio
+async def test_skill_step_timeout_is_forwarded_to_real_style_executor() -> None:
+    class TimeoutAwareExecutor:
+        default_timeout = 60
+
+        def __init__(self) -> None:
+            self.timeout = None
+
+        async def execute(self, command, timeout=None):
+            self.timeout = timeout
+            return ExecutionResult(exit_code=0, stdout="ok", stderr="", duration_ms=1)
+
+    runtime = FakeRuntime()
+    runtime.executor = TimeoutAwareExecutor()
+    command = PendingCommand(
+        raw="ssh unit-host uptime",
+        target="unit-host",
+        target_env="test",
+        executor="ssh",
+        actual_command="uptime",
+        source="skill",
+        timeout_seconds=19,
+    )
+
+    result = await _execute(runtime, command, "sess_timeout")
+
+    assert result.exit_code == 0
+    assert runtime.executor.timeout == 19
+
+
+@pytest.mark.asyncio
+async def test_restore_waiting_skill_uses_frozen_snapshot(tmp_path) -> None:
+    db_path = tmp_path / "shell_agent.db"
+    await init_db(str(db_path))
+    db = await connect(str(db_path))
+    runtime = FakeRuntime()
+    runtime.db = db
+    try:
+        await ensure_session(db, "sess_skill_restore", session_type="chat")
+        task = await create_task(db, "sess_skill_restore", "chat", title="检查资源")
+        await update_task(
+            db,
+            task["id"],
+            status="waiting_confirm",
+            pending_command="df -h",
+            pending_target="unit-host",
+            confirm_mode="auto_safe",
+            workflow_snapshot={
+                "operation_id": "cmd_frozen_operation",
+                "source": "skill",
+                "user_input": "检查资源",
+                "intent": "检查磁盘",
+                "response_mode": "workflow",
+                "step_index": 2,
+                "max_steps": 3,
+                "step_queue": [{"command": "ssh unit-host uptime"}],
+                "skill_name": "resource_summary",
+                "skill_version": "2",
+                "skill_hash": "frozen-hash",
+                "skill_default_confirm_mode": "auto_safe",
+                "skill_force_confirm": False,
+                "skill_on_failure": "abort",
+                "step_name": "磁盘",
+                "timeout_seconds": 33,
+            },
+        )
+
+        restored = await _restore_pending_command_from_task(
+            runtime, "sess_skill_restore", "chat", task["id"]
+        )
+        assert restored is not None
+        assert restored.id == "cmd_frozen_operation"
+        assert restored.source == "skill"
+        assert restored.skill_hash == "frozen-hash"
+        assert restored.step_queue == [{"command": "ssh unit-host uptime"}]
+        assert restored.timeout_seconds == 33
+    finally:
+        await db.close()
 
 
 async def _drain_runtime_tasks(runtime: FakeRuntime) -> None:
@@ -822,6 +1383,7 @@ async def test_web_prod_dangerous_command_requires_secondary_confirmation(monkey
     assert websocket.messages[-1]["type"] == "system"
     assert "二次确认不匹配" in websocket.messages[-1]["content"]
 
+
     await _handle_confirm(
         websocket,
         runtime,
@@ -835,6 +1397,54 @@ async def test_web_prod_dangerous_command_requires_secondary_confirmation(monkey
     assert runtime.executor.execute_calls == 1
     assert "sess_prod:command" not in runtime.pending_commands
     assert runtime.audit_records[-1]["executed"] is True
+
+
+@pytest.mark.asyncio
+async def test_chat_confirmation_policy_status_is_transient_and_not_persisted(
+    tmp_path, monkeypatch
+) -> None:
+    db_path = tmp_path / "shell_agent.db"
+    await init_db(str(db_path))
+    db = await connect(str(db_path))
+    runtime = FakeRuntime()
+    runtime.db = db
+    websocket = FakeWebSocket()
+    monkeypatch.setattr("shell_agent.safety.policy.read_safety_yaml", lambda _filename: {})
+
+    try:
+        await ensure_session(db, "sess_transient_policy", session_type="chat")
+        command = PendingCommand(
+            raw="ssh unit-host 'rm app.log'",
+            target="unit-host",
+            target_env="dev",
+            executor="ssh",
+            actual_command="rm app.log",
+        )
+
+        await _preview_and_apply_policy(
+            websocket=websocket,
+            rt=runtime,
+            session_id="sess_transient_policy",
+            command=command,
+            confirm_mode="auto_safe",
+            channel="chat",
+        )
+
+        policy_status = next(
+            item
+            for item in websocket.messages
+            if item.get("content") == "自动安全模式：该风险等级需要人工确认"
+        )
+        assert policy_status["transient"] is True
+
+        session = await get_session(db, "sess_transient_policy")
+        assert session is not None
+        assert "自动安全模式：该风险等级需要人工确认" not in {
+            item["content"] for item in session["messages"]
+        }
+        assert any(item.get("type") == "command_preview" for item in session["messages"])
+    finally:
+        await db.close()
 
 
 @pytest.mark.asyncio
@@ -1748,11 +2358,90 @@ async def test_web_session_pending_state_restores_chat_confirmation(monkeypatch)
         target="unit-host",
     )
 
-    pending = _session_pending_state(runtime, "sess_pending_restore")
+    pending = await _session_pending_state(runtime, "sess_pending_restore")
     assert pending["chat"]["command"] == "df -h"
     assert pending["chat"]["target"] == "unit-host"
     assert pending["chat"]["confirm_mode"] == "interactive"
     assert pending["chat"]["risk_level"] == "safe"
+    assert pending["chat"]["operation_id"] == runtime.pending_commands[
+        "sess_pending_restore:chat"
+    ].id
+
+
+@pytest.mark.asyncio
+async def test_session_pending_state_restores_persisted_command_after_restart(tmp_path) -> None:
+    db_path = tmp_path / "shell_agent.db"
+    await init_db(str(db_path))
+    db = await connect(str(db_path))
+    runtime = FakeRuntime()
+    runtime.db = db
+    try:
+        await ensure_session(db, "sess_restart", session_type="chat", title="检查磁盘")
+        task = await create_task(db, "sess_restart", "chat", title="检查磁盘")
+        await update_task(
+            db,
+            task["id"],
+            status="waiting_confirm",
+            pending_command="df -h",
+            pending_target="unit-host",
+            confirm_mode="interactive",
+            workflow_snapshot={
+                "operation_id": "cmd_restart",
+                "source": "skill",
+                "skill_name": "resource_summary",
+                "skill_version": "2",
+                "skill_had_failures": False,
+                "requires_secondary_confirm": True,
+                "secondary_confirm_expected": "unit-host",
+                "secondary_confirm_label": "输入 unit-host 确认",
+            },
+        )
+
+        pending = await _session_pending_state(runtime, "sess_restart")
+
+        assert pending["chat"]["task_id"] == task["id"]
+        assert pending["chat"]["operation_id"] == "cmd_restart"
+        assert pending["chat"]["command"] == "df -h"
+        assert pending["chat"]["requires_secondary_confirm"] is True
+        assert pending["chat"]["secondary_confirm_expected"] == "unit-host"
+        assert runtime.pending_commands["sess_restart:chat"].skill_name == "resource_summary"
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_web_confirm_rejects_a_stale_command_operation(monkeypatch) -> None:
+    runtime = FakeRuntime()
+    websocket = FakeWebSocket()
+    command = PendingCommand(
+        raw="ssh unit-host '/app/start.sh'",
+        target="unit-host",
+        target_env="test",
+        executor="ssh",
+        actual_command="/app/start.sh",
+        task_id="task_workflow",
+        step_index=3,
+        max_steps=4,
+    )
+    runtime.pending_commands["sess_stale_confirm:chat"] = command
+
+    await _handle_confirm(
+        websocket,
+        runtime,
+        "sess_stale_confirm",
+        confirmed=True,
+        channel="chat",
+        task_id=command.task_id,
+        operation_id="cmd_previous_step",
+        request_id="request-stale",
+    )
+
+    assert runtime.executor.execute_calls == 0
+    assert runtime.pending_commands["sess_stale_confirm:chat"] is command
+    ack = websocket.messages[-1]
+    assert ack["type"] == "confirm_ack"
+    assert ack["accepted"] is False
+    assert ack["status"] == "stale"
 
 
 @pytest.mark.asyncio
@@ -2000,14 +2689,16 @@ async def test_web_chat_collects_multiple_servers_without_analysis(monkeypatch) 
     assert first_pending.skill_name == "java_processes"
     assert first_pending.response_mode == "workflow"
     assert first_pending.max_steps == 2
-    assert first_pending.step_queue == [
-        {
-            "command": "ssh dev-02 'ps -ef | grep java | grep -v grep'",
-            "intent": "查看 dev-02 上运行的 Java 进程",
-            "explanation": "使用 ps -ef 列出进程，通过 grep java 过滤 Java 进程，并排除 grep 命令本身。",
-            "skill_step_name": "Java 进程",
-        }
-    ]
+    assert len(first_pending.step_queue) == 1
+    queued_step = first_pending.step_queue[0]
+    assert queued_step["command"] == "ssh dev-02 'ps -ef | grep java | grep -v grep'"
+    assert queued_step["intent"] == "查看 dev-02 上运行的 Java 进程"
+    assert queued_step["skill_step_name"] == "Java 进程"
+    assert queued_step["confirm"] is False
+    assert queued_step["timeout_seconds"] == 30
+    assert queued_step["on_failure"] == "abort"
+    assert queued_step["skill_version"] == "2"
+    assert len(queued_step["skill_hash"]) == 64
 
     await _handle_confirm(websocket, runtime, "sess_collect", confirmed=True, channel="chat")
     await _drain_runtime_tasks(runtime)

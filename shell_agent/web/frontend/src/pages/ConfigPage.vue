@@ -7,12 +7,14 @@ import ConfigTip from '../components/config/ConfigTip.vue'
 import SafetyPolicyEditor from '../components/config/SafetyPolicyEditor.vue'
 import SkillDetailDialog from '../components/config/SkillDetailDialog.vue'
 import { useSettingsStore } from '../stores/settings'
+import { confirmAction } from '../utils/confirm'
 
 type ConfigTab = 'llm' | 'context' | 'ssh' | 'safety' | 'skills'
 
 const settings = useSettingsStore()
 const activeTab = ref<ConfigTab>('llm')
 const selectedSkill = ref('')
+const scanningSkills = ref(false)
 const llm = reactive({
   provider: 'openai',
   model: '',
@@ -36,7 +38,7 @@ const ssh = reactive({
   idle_timeout: 300,
   total_max: 50,
   default_timeout: 60,
-  trust_unknown_hosts: false,
+  trust_unknown_hosts: true,
 })
 
 function hydrate() {
@@ -67,13 +69,46 @@ function hydrate() {
     idle_timeout: Number(sourceSsh.idle_timeout ?? 300),
     total_max: Number(sourceSsh.total_max ?? 50),
     default_timeout: Number(sourceSsh.default_timeout ?? 60),
-    trust_unknown_hosts: Boolean(sourceSsh.trust_unknown_hosts),
+    trust_unknown_hosts: Boolean(sourceSsh.trust_unknown_hosts ?? true),
   })
 }
 
 async function reload() {
-  await settings.load()
+  await Promise.all([settings.load(), settings.loadSkillCandidates()])
   hydrate()
+}
+
+async function scanSkillHistory(semantic = true) {
+  scanningSkills.value = true
+  try {
+    await settings.scanSkillCandidates(30, 3, semantic)
+  } finally {
+    scanningSkills.value = false
+  }
+}
+
+async function acceptCandidate(id: string, name: string) {
+  if (!confirmAction(`确认把候选 ${name} 创建为停用 Skill 吗？创建后仍需人工检查并手动启用。`)) return
+  await settings.acceptSkillCandidate(id)
+}
+
+async function rejectCandidate(id: string, name: string) {
+  if (!confirmAction(`确定拒绝 Skill 候选 ${name} 吗？`)) return
+  await settings.rejectSkillCandidate(id)
+}
+
+function evidenceTargets(evidence: Record<string, unknown>): string {
+  const targets = evidence.targets
+  return Array.isArray(targets) ? targets.map(String).join('、') : ''
+}
+
+function evidenceMode(evidence: Record<string, unknown>): string {
+  return evidence.grouping_mode === 'semantic' ? '语义归组' : '精确归组'
+}
+
+function evidenceParams(evidence: Record<string, unknown>): string {
+  const params = evidence.parameterized_fields
+  return Array.isArray(params) ? params.map(String).join('、') : ''
 }
 
 async function saveLlm() {
@@ -275,7 +310,12 @@ onMounted(() => {
                   <h2 class="panel-card-title">Template Skills</h2>
                   <small class="text-muted">当前后端已加载的声明式运维能力。</small>
                 </div>
-                <span class="badge badge-accent">{{ settings.skills.length }} 个</span>
+                <div class="skill-header-actions">
+                  <span class="badge badge-accent">{{ settings.skills.length }} 个</span>
+                  <button class="btn btn-small" type="button" :disabled="scanningSkills" @click="scanSkillHistory(false)">精确扫描</button>
+                  <button class="btn btn-small" type="button" :disabled="scanningSkills" @click="scanSkillHistory(true)">{{ scanningSkills ? '扫描中…' : '语义扫描最近 30 天' }}</button>
+                  <button class="btn btn-primary btn-small" type="button" @click="selectedSkill = '__new__'">新建 Skill</button>
+                </div>
               </div>
               <div class="data-table-wrap skills-table">
                 <table class="data-table">
@@ -292,12 +332,57 @@ onMounted(() => {
                   </tbody>
                 </table>
               </div>
+              <section class="skill-candidates-section">
+                <div class="candidate-heading">
+                  <div>
+                    <h3>历史候选</h3>
+                    <small class="text-muted">语义扫描只向已配置模型发送脱敏任务摘要；模型仅分组，命令模板由本地确定性编译，批准后仍只创建停用 Skill。</small>
+                  </div>
+                  <span class="badge" :class="settings.skillCandidates.length ? 'badge-warning' : ''">{{ settings.skillCandidates.length }} 待审核</span>
+                </div>
+                <div v-if="settings.skillCandidatesLoading" class="loading-state"><span class="spinner" /><span>正在加载候选…</span></div>
+                <div v-else-if="!settings.skillCandidates.length" class="empty-state compact-empty">暂无待审核候选，可通过对话或上方按钮扫描历史任务。</div>
+                <div v-else class="candidate-list">
+                  <details v-for="candidate in settings.skillCandidates" :key="candidate.id" class="candidate-card">
+                    <summary>
+                      <span><strong>{{ candidate.name }}</strong><small>{{ candidate.description }}</small></span>
+                      <span class="candidate-metrics">
+                        <span class="badge">{{ candidate.occurrence_count }} 次</span>
+                        <span class="badge" :class="candidate.risk_level === 'dangerous' ? 'badge-warning' : 'badge-success'">{{ candidate.risk_level }}</span>
+                        <span>{{ Math.round(candidate.confidence * 100) }}%</span>
+                      </span>
+                    </summary>
+                    <div class="candidate-body">
+                      <div class="candidate-evidence">
+                        <strong>证据</strong>
+                        <span>分组：{{ evidenceMode(candidate.evidence) }}</span>
+                        <span>目标：{{ evidenceTargets(candidate.evidence) || '-' }}</span>
+                        <span v-if="evidenceParams(candidate.evidence)">参数化：{{ evidenceParams(candidate.evidence) }}</span>
+                        <span>来源任务：{{ candidate.source_task_ids.length }} 个</span>
+                      </div>
+                      <pre class="code-block candidate-yaml">{{ candidate.draft_yaml }}</pre>
+                      <div v-if="settings.skillCandidatePreviews[candidate.id]" class="candidate-preview">
+                        <strong>安全预览（不会执行）</strong>
+                        <article v-for="step in settings.skillCandidatePreviews[candidate.id].steps" :key="String(step.index)">
+                          <span>{{ step.index }}. {{ step.skill_step_name }} · {{ step.risk_level }}</span>
+                          <pre class="code-block">{{ step.command }}</pre>
+                        </article>
+                      </div>
+                      <div class="candidate-actions">
+                        <button class="btn" type="button" @click="settings.previewSkillCandidate(candidate.id)">安全预览</button>
+                        <button class="btn" type="button" @click="rejectCandidate(candidate.id, candidate.name)">拒绝</button>
+                        <button class="btn btn-primary" type="button" @click="acceptCandidate(candidate.id, candidate.name)">批准并创建停用 Skill</button>
+                      </div>
+                    </div>
+                  </details>
+                </div>
+              </section>
             </div>
           </AsyncState>
         </div>
       </div>
     </div>
-    <SkillDetailDialog v-if="selectedSkill" :name="selectedSkill" @close="selectedSkill = ''" @saved="selectedSkill = ''" />
+    <SkillDetailDialog v-if="selectedSkill" :name="selectedSkill === '__new__' ? '' : selectedSkill" :creating="selectedSkill === '__new__'" @close="selectedSkill = ''" @saved="selectedSkill = ''" />
   </section>
 </template>
 
@@ -318,5 +403,23 @@ onMounted(() => {
 .check-row span { display: grid; gap: 3px; }
 .check-row small { color: var(--text-muted); }
 .skills-table { max-height: calc(100vh - 250px); }
+.skill-header-actions { display: flex; align-items: center; gap: 8px; }
+.skill-candidates-section { margin-top: 18px; padding-top: 16px; border-top: 1px solid var(--border); }
+.candidate-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; margin-bottom: 10px; }
+.candidate-heading h3 { margin: 0 0 4px; font-size: 14px; }
+.candidate-list { display: grid; gap: 8px; }
+.candidate-card { border: 1px solid var(--border); border-radius: 9px; background: var(--bg-primary); }
+.candidate-card summary { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 11px 12px; cursor: pointer; }
+.candidate-card summary > span:first-child { display: grid; gap: 3px; }
+.candidate-card summary small { color: var(--text-muted); }
+.candidate-metrics { display: flex; align-items: center; gap: 7px; color: var(--text-muted); }
+.candidate-body { display: grid; gap: 10px; padding: 0 12px 12px; }
+.candidate-evidence { display: flex; flex-wrap: wrap; gap: 12px; color: var(--text-secondary); font-size: 12px; }
+.candidate-yaml { max-height: 320px; overflow: auto; }
+.candidate-actions { display: flex; justify-content: flex-end; gap: 8px; }
+.candidate-preview { display: grid; gap: 8px; padding: 10px; border: 1px solid var(--border); border-radius: 8px; background: var(--bg-secondary); }
+.candidate-preview article { display: grid; gap: 5px; }
+.candidate-preview .code-block { margin: 0; }
+.compact-empty { padding: 18px; }
 @media (max-width: 760px) { .config-grid { grid-template-columns: 1fr; } .config-nav { flex-direction: row; } .config-nav button { flex: 1; } }
 </style>

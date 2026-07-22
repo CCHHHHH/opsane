@@ -14,6 +14,13 @@ export interface ServerInput {
   tags: string[]
 }
 
+export interface ServerConnectionTestResult {
+  ok: boolean
+  message?: string
+  latency_ms?: number
+  error?: string
+}
+
 export interface CredentialInput {
   id: string
   type: 'password' | 'key'
@@ -59,6 +66,7 @@ export const useInventoryStore = defineStore('inventory', {
     credentials: [] as CredentialRecord[],
     loading: false,
     saving: false,
+    testingServer: false,
     error: '',
   }),
   actions: {
@@ -98,6 +106,17 @@ export const useInventoryStore = defineStore('inventory', {
         throw error
       } finally {
         this.saving = false
+      }
+    },
+    async testServerConnection(input: ServerInput) {
+      this.testingServer = true
+      this.error = ''
+      try {
+        const result = await http.post<ServerConnectionTestResult>('/api/servers/test-connection', input)
+        if (!result.ok) throw new Error(result.error || 'SSH 连接测试失败')
+        return result
+      } finally {
+        this.testingServer = false
       }
     },
     async removeServer(alias: string) {

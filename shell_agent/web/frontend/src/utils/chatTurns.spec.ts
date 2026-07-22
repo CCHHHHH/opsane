@@ -82,4 +82,62 @@ describe('chat turn projection', () => {
       expect(item.result?.output).toBe('已停止')
     }
   })
+
+  it('does not attach a new turn state to the previous turn before its user message arrives', () => {
+    const turns = groupChatTurns([
+      entry('u1', { type: 'user_message', turn_id: 'turn-1', content: '查看磁盘占用' }),
+      entry('r1', {
+        type: 'execution_result', turn_id: 'turn-1', task_id: 'turn-1', success: true,
+        output: '/usr 26G', exit_code: 0, command: 'du -sh /*', target: 'dev-01',
+      }),
+      entry('a1', { type: 'agent', turn_id: 'turn-1', content: '/usr 占用最多。' }),
+      entry('done1', {
+        type: 'turn_state', turn_id: 'turn-1', channel: 'chat', status: 'completed',
+        label: '任务完成', active: false,
+      }),
+      // The server deliberately emits the next state before its user message.
+      entry('thinking2', {
+        type: 'turn_state', turn_id: 'turn-2', channel: 'chat', status: 'thinking',
+        label: '正在思考', active: true,
+      }),
+      entry('u2', { type: 'user_message', turn_id: 'turn-2', content: '继续查看日志' }),
+    ])
+
+    expect(turns).toHaveLength(2)
+    expect(turns[0].summary.status).toBe('success')
+    expect(turns[0].summary.statusLabel).toBe('已完成')
+    expect(turns[1].summary.title).toBe('继续查看日志')
+    expect(turns[1].summary.status).toBe('warning')
+    expect(turns[1].summary.statusLabel).toBe('正在思考')
+  })
+
+  it('keeps progress and confirmation policy chatter out of the durable timeline', () => {
+    const turns = groupChatTurns([
+      entry('u1', { type: 'user_message', turn_id: 'turn-1', content: '检查 Kafka 消息' }),
+      entry('mode', { type: 'system', turn_id: 'turn-1', content: '自动安全模式：该风险等级需要人工确认' }),
+      entry('progress', { type: 'system', turn_id: 'turn-1', content: '正在生成最终结论...' }),
+      entry('tagged', { type: 'system', turn_id: 'turn-1', content: '未来新增的处理状态', transient: true }),
+      entry('agent', { type: 'agent', turn_id: 'turn-1', content: 'Kafka 消息格式正常。' }),
+    ])
+
+    expect(turns[0].items).toHaveLength(1)
+    expect(turns[0].items[0].kind).toBe('event')
+    if (turns[0].items[0].kind === 'event') {
+      expect(turns[0].items[0].entry.event.content).toBe('Kafka 消息格式正常。')
+    }
+  })
+
+  it('keeps durable policy outcomes visible', () => {
+    const turns = groupChatTurns([
+      entry('u1', { type: 'user_message', turn_id: 'turn-1', content: '删除生产日志' }),
+      entry('blocked', { type: 'system', turn_id: 'turn-1', content: '策略阻断：生产环境禁止该操作' }),
+      entry('dry-run', { type: 'system', turn_id: 'turn-1', content: '仅预览模式：只生成命令，不执行' }),
+    ])
+
+    expect(turns[0].items).toHaveLength(2)
+    expect(turns[0].items.map((item) => item.kind === 'event' ? item.entry.event.content : '')).toEqual([
+      '策略阻断：生产环境禁止该操作',
+      '仅预览模式：只生成命令，不执行',
+    ])
+  })
 })

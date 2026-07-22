@@ -16,11 +16,14 @@ from shell_agent.executors.ssh import SSHExecutor
 from shell_agent.llm.adapter import LLMAdapter
 from shell_agent.storage.database import connect, init_db
 from shell_agent.storage.file_transfers import interrupt_running_file_transfers
+from shell_agent.storage.memories import maintain_memories
 from shell_agent.storage.tasks import reconcile_orphaned_tasks
 from shell_agent.utils.config import (
     AppConfig, load_config, load_credentials, load_inventory, load_services,
     ServerEntry, LLMConfig,
 )
+
+MEMORY_MAINTENANCE_INTERVAL_SECONDS = 24 * 60 * 60
 
 
 class Runtime:
@@ -71,6 +74,13 @@ class Runtime:
         """初始化数据库、执行器、LLM"""
         await init_db(self.config.storage.sqlite_path)
         self.db = await connect(self.config.storage.sqlite_path)
+        memory_maintenance = await maintain_memories(self.db)
+        if memory_maintenance["expired"] or memory_maintenance["purged"]:
+            logger.info(
+                "启动时完成记忆维护: "
+                f"expired={memory_maintenance['expired']} "
+                f"purged={memory_maintenance['purged']}"
+            )
         interrupted = await reconcile_orphaned_tasks(self.db)
         if interrupted:
             logger.warning(f"启动时已收口 {len(interrupted)} 个未完成的孤儿任务")
@@ -93,7 +103,28 @@ class Runtime:
         self.llm = LLMAdapter(
             config=self.config.llm, instances_description=instances_desc
         )
+        memory_task = asyncio.create_task(self._memory_maintenance_loop())
+        self.background_tasks.add(memory_task)
+        memory_task.add_done_callback(self.background_tasks.discard)
         logger.info("Web Runtime 启动完成")
+
+    async def _memory_maintenance_loop(self) -> None:
+        """Expire and purge memories daily while a long-running service stays up."""
+        while True:
+            await asyncio.sleep(MEMORY_MAINTENANCE_INTERVAL_SECONDS)
+            if not self.db:
+                return
+            try:
+                result = await maintain_memories(self.db)
+                if result["expired"] or result["purged"]:
+                    logger.info(
+                        "定时完成记忆维护: "
+                        f"expired={result['expired']} purged={result['purged']}"
+                    )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("定时记忆维护失败，将在下个周期重试")
 
     async def initialize_deployment_runtime(self):
         """Initialize deployment persistence, reconciliation and SSH adapter."""

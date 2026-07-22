@@ -61,11 +61,29 @@ function signature(event: ServerEvent | undefined): string {
   return `${command}\u0000${text(event, 'target')}`
 }
 
+const transientSystemMessages = new Set([
+  '正在生成命令',
+  '正在调整方案',
+  '方案已确认，正在生成命令步骤',
+  '正在分析结果',
+  '正在判断是否需要继续下一步',
+  '正在生成最终结论',
+  '自动安全模式：安全命令自动执行',
+  '自动安全模式：该风险等级需要人工确认',
+  '完全访问模式：命令自动执行',
+  'auto_safe 模式：safe 命令自动执行',
+  'auto_safe 模式：该风险等级需要人工确认',
+  'full_access 模式：命令自动执行',
+])
+
 function isTransientEvent(event: ServerEvent): boolean {
   if (event.type === 'turn_state') return true
   if (event.type === 'confirm_prompt') return true
   if (event.type !== 'system') return false
-  return /^(正在|开始)(生成命令|分析|处理|执行)/.test(text(event, 'content'))
+  if (event.transient === true) return true
+  const content = text(event, 'content').replace(/[.…]+$/, '')
+  return transientSystemMessages.has(content)
+    || /^(正在|开始)(生成命令|分析|处理|执行)/.test(content)
 }
 
 export function buildTurnItems(entries: TimelineEntry[]): TurnRenderItem[] {
@@ -204,28 +222,29 @@ export function groupChatTurns(entries: TimelineEntry[]): ChatTurn[] {
   const byId = new Map<string, ChatTurn>()
   let current: ChatTurn | undefined
 
+  const ensureTurn = (id: string): ChatTurn => {
+    const existing = byId.get(id)
+    if (existing) return existing
+    const turn: ChatTurn = { id, entries: [], items: [], summary: summarizeTurn(undefined, []) }
+    turns.push(turn)
+    byId.set(id, turn)
+    return turn
+  }
+
   for (const entry of entries) {
     const event = entry.event
     if (event.type === 'user_message') {
       const id = turnId(entry, `turn-${entry.id}`)
-      current = byId.get(id)
-      if (!current) {
-        current = { id, user: entry, entries: [], items: [], summary: summarizeTurn(entry, []) }
-        turns.push(current)
-        byId.set(id, current)
-      } else {
-        current.user = entry
-      }
+      current = ensureTurn(id)
+      current.user = entry
       continue
     }
 
     const explicitId = text(event, 'turn_id')
-    if (explicitId && byId.has(explicitId)) current = byId.get(explicitId)
+    if (explicitId) current = ensureTurn(explicitId)
     if (!current) {
       const id = explicitId || `turn-${entry.id}`
-      current = { id, entries: [], items: [], summary: summarizeTurn(undefined, []) }
-      turns.push(current)
-      byId.set(id, current)
+      current = ensureTurn(id)
     }
     current.entries.push(entry)
   }

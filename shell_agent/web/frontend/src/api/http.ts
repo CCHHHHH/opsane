@@ -34,6 +34,10 @@ function messageFromPayload(payload: unknown, fallback: string): string {
     const error = (payload as { error?: unknown; detail?: unknown }).error
       ?? (payload as { detail?: unknown }).detail
     if (typeof error === 'string' && error.trim()) return error
+    if (error && typeof error === 'object') {
+      const message = (error as { message?: unknown }).message
+      if (typeof message === 'string' && message.trim()) return message
+    }
   }
   return fallback
 }

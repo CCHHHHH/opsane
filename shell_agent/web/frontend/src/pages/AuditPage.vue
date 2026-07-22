@@ -3,6 +3,7 @@ import { onMounted } from 'vue'
 
 import AsyncState from '../components/common/AsyncState.vue'
 import PageHeader from '../components/common/PageHeader.vue'
+import PaginationBar from '../components/common/PaginationBar.vue'
 import { useAuditStore } from '../stores/audit'
 
 const audit = useAuditStore()
@@ -22,7 +23,7 @@ onMounted(() => {
     <div class="page-container">
       <PageHeader title="审计日志" description="查看命令预览、确认与实际执行留下的审计记录。">
         <template #actions>
-          <input v-model="audit.target" class="input audit-filter" placeholder="按目标过滤" @keyup.enter="audit.load()" />
+          <input v-model="audit.target" class="input audit-filter" placeholder="按目标过滤" @keyup.enter="audit.search()" />
           <button class="btn" type="button" :disabled="audit.loading" @click="audit.load()">刷新</button>
         </template>
       </PageHeader>
@@ -68,6 +69,13 @@ onMounted(() => {
             </table>
           </div>
         </AsyncState>
+        <PaginationBar
+          v-if="!audit.loading && !audit.error"
+          :page="audit.page"
+          :total-pages="audit.totalPages"
+          :total="audit.total"
+          @change="audit.goToPage($event)"
+        />
       </div>
     </div>
   </section>

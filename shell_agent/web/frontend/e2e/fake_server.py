@@ -47,6 +47,7 @@ state: dict[str, Any] = {
     "deployment_execution_count": 0,
     "deployment_rollback_count": 0,
     "deployment_run": None,
+    "skill_candidate_status": "pending",
 }
 session_subscribers: set[WebSocket] = set()
 
@@ -472,6 +473,8 @@ async def reset(request: Request) -> dict[str, Any]:
         deployment_execution_count=0,
         deployment_rollback_count=0,
         deployment_run=_make_deployment_run(deployment_status) if deployment_status else None,
+        skill_candidate_status="pending",
+        last_skill_scan=None,
     )
     return dict(state)
 
@@ -623,6 +626,105 @@ async def services() -> dict[str, list[Any]]:
 @app.get("/api/credentials")
 async def credentials() -> dict[str, list[Any]]:
     return {"credentials": []}
+
+
+def _skill_candidate() -> dict[str, Any]:
+    return {
+        "id": "skill_candidate_e2e",
+        "name": "learned_uptime_e2e",
+        "description": "从 3 次成功历史任务中提炼：检查运行时间",
+        "status": state.get("skill_candidate_status", "pending"),
+        "draft_yaml": "name: learned_uptime_e2e\nversion: '1'\ndescription: 检查运行时间\ncategory: learned\nenabled: false\ntriggers:\n- 检查运行时间\nparams:\n- name: target\n  type: server_alias\n  required: true\nsteps:\n- name: 历史流程步骤 1\n  command: ssh {{target}} 'uptime'\n  confirm: false\n  timeout_seconds: 60\n  on_failure: abort\nsafety:\n  default_confirm_mode: interactive\n",
+        "evidence": {"targets": ["fake-host"], "occurrences": 3},
+        "confidence": 0.79,
+        "risk_level": "safe",
+        "occurrence_count": 3,
+        "source_task_ids": ["task-1", "task-2", "task-3"],
+        "created_at": "2026-07-22T10:00:00",
+        "expires_at": "2026-08-21T10:00:00",
+    }
+
+
+@app.get("/api/config")
+async def app_config() -> dict[str, Any]:
+    return {
+        "llm": {"provider": "openai", "model": "fake", "api_key": "", "api_key_set": False},
+        "ssh": {"max_per_host": 2, "idle_timeout": 300, "total_max": 10, "default_timeout": 60, "trust_unknown_hosts": False},
+        "session": {},
+        "context": {},
+    }
+
+
+@app.get("/api/safety/config")
+async def safety_config() -> dict[str, Any]:
+    return {"environments": {}, "safe_patterns": [], "forbidden_patterns": []}
+
+
+@app.get("/api/skills")
+async def skills() -> dict[str, Any]:
+    items = []
+    if state.get("skill_candidate_status") == "accepted":
+        items.append({
+            "name": "learned_uptime_e2e",
+            "description": "检查运行时间",
+            "category": "learned",
+            "triggers": ["检查运行时间"],
+            "enabled": False,
+        })
+    return {"skills": items}
+
+
+@app.get("/api/skill-candidates")
+async def skill_candidates(status: str = "pending", page: int = 1, page_size: int = 20) -> dict[str, Any]:
+    items = [_skill_candidate()] if status == state.get("skill_candidate_status") else []
+    return {"candidates": items, "pagination": {"page": page, "page_size": page_size, "total": len(items), "total_pages": 1}}
+
+
+@app.post("/api/skill-candidates/skill_candidate_e2e/preview")
+async def preview_skill_candidate() -> dict[str, Any]:
+    return {
+        "ok": True,
+        "candidate_id": "skill_candidate_e2e",
+        "test_input": "检查运行时间",
+        "params": {"target": "fake-host"},
+        "missing_params": [],
+        "steps": [{
+            "index": 1,
+            "command": "ssh fake-host 'uptime'",
+            "skill_step_name": "历史流程步骤 1",
+            "risk_level": "safe",
+            "will_execute": False,
+        }],
+        "will_execute": False,
+    }
+
+
+@app.post("/api/skill-candidates/skill_candidate_e2e/accept")
+async def accept_skill_candidate() -> dict[str, Any]:
+    if state.get("skill_candidate_status") != "pending":
+        return JSONResponse({"error": "候选已审核"}, status_code=409)
+    state["skill_candidate_status"] = "accepted"
+    return {"ok": True, "skill": {"name": "learned_uptime_e2e", "enabled": False}}
+
+
+@app.post("/api/skill-candidates/skill_candidate_e2e/reject")
+async def reject_skill_candidate() -> dict[str, Any]:
+    state["skill_candidate_status"] = "rejected"
+    return {"ok": True}
+
+
+@app.post("/api/skill-candidates/scan")
+async def scan_skill_candidates(request: Request) -> dict[str, Any]:
+    state["last_skill_scan"] = await request.json()
+    return {
+        "ok": True,
+        "scanned_tasks": 3,
+        "repeated_groups": 1,
+        "exact_groups": 1,
+        "semantic_groups": 0,
+        "semantic": {"status": "completed"},
+        "created": [_skill_candidate()],
+    }
 
 
 @app.get("/api/sessions/{session_id}/files")

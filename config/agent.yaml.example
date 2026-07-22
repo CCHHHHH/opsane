@@ -21,7 +21,7 @@ ssh:
   idle_timeout: 300
   total_max: 50
   default_timeout: 60
-  trust_unknown_hosts: false  # dev 环境可设 true；生产建议保持 false
+  trust_unknown_hosts: true  # 首次使用默认接受未知主机；生产环境建议关闭并维护 known_hosts
 
 # 存储
 storage:

@@ -122,6 +122,7 @@ CREATE TABLE IF NOT EXISTS agent_tasks (
     pending_command TEXT,
     pending_target TEXT,
     confirm_mode TEXT,
+    workflow_snapshot TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     completed_at TEXT,
@@ -182,6 +183,25 @@ CREATE TABLE IF NOT EXISTS service_profile_candidates (
     reviewed_by TEXT
 );
 
+CREATE TABLE IF NOT EXISTS skill_candidates (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    description TEXT,
+    fingerprint TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending',
+    draft_yaml TEXT NOT NULL,
+    evidence TEXT,
+    confidence REAL DEFAULT 0.0,
+    risk_level TEXT DEFAULT 'caution',
+    occurrence_count INTEGER DEFAULT 0,
+    source_task_ids TEXT,
+    created_at TEXT NOT NULL,
+    expires_at TEXT,
+    reviewed_at TEXT,
+    reviewed_by TEXT,
+    published_skill_name TEXT
+);
+
 CREATE INDEX IF NOT EXISTS idx_audit_target_time ON audit_logs(target, timestamp);
 CREATE INDEX IF NOT EXISTS idx_audit_session ON audit_logs(session_id);
 CREATE INDEX IF NOT EXISTS idx_session_messages_session_time ON session_messages(session_id, created_at);
@@ -194,6 +214,8 @@ CREATE INDEX IF NOT EXISTS idx_global_memories_subject ON global_memories(subjec
 CREATE INDEX IF NOT EXISTS idx_global_memories_target ON global_memories(target, deleted_at);
 CREATE INDEX IF NOT EXISTS idx_profile_candidates_status ON service_profile_candidates(status, created_at);
 CREATE INDEX IF NOT EXISTS idx_profile_candidates_fingerprint ON service_profile_candidates(fingerprint, status);
+CREATE INDEX IF NOT EXISTS idx_skill_candidates_status ON skill_candidates(status, created_at);
+CREATE INDEX IF NOT EXISTS idx_skill_candidates_fingerprint ON skill_candidates(fingerprint, status);
 """
 
 _MIGRATIONS = [
@@ -223,6 +245,7 @@ _MIGRATIONS = [
     "ALTER TABLE session_files ADD COLUMN layout_preview_source_sha256 TEXT",
     "ALTER TABLE session_files ADD COLUMN layout_preview_claim_id TEXT",
     "ALTER TABLE session_files ADD COLUMN layout_preview_updated_at TEXT",
+    "ALTER TABLE agent_tasks ADD COLUMN workflow_snapshot TEXT",
 ]
 
 _POST_MIGRATION_SQL = [
@@ -230,8 +253,11 @@ _POST_MIGRATION_SQL = [
     "CREATE INDEX IF NOT EXISTS idx_sessions_type_pinned_updated ON sessions(type, pinned_at, updated_at)",
     "CREATE INDEX IF NOT EXISTS idx_global_memories_status ON global_memories(status, deleted_at)",
     "CREATE INDEX IF NOT EXISTS idx_global_memories_fingerprint ON global_memories(fingerprint, deleted_at)",
+    "CREATE INDEX IF NOT EXISTS idx_global_memories_issue_retention ON global_memories(status, updated_at)",
     "CREATE INDEX IF NOT EXISTS idx_profile_candidates_status ON service_profile_candidates(status, created_at)",
     "CREATE INDEX IF NOT EXISTS idx_profile_candidates_fingerprint ON service_profile_candidates(fingerprint, status)",
+    "CREATE INDEX IF NOT EXISTS idx_skill_candidates_status ON skill_candidates(status, created_at)",
+    "CREATE INDEX IF NOT EXISTS idx_skill_candidates_fingerprint ON skill_candidates(fingerprint, status)",
     "UPDATE global_memories SET type = COALESCE(NULLIF(type, ''), 'fact'), status = COALESCE(NULLIF(status, ''), 'confirmed'), observed_at = COALESCE(observed_at, created_at)",
 ]
 

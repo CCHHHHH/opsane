@@ -15,6 +15,9 @@ class SkillParam:
     description: str = ""
     pattern: str = ""
     enum: list[str] = field(default_factory=list)
+    extract: str = ""
+    minimum: int | None = None
+    maximum: int | None = None
 
 
 @dataclass(frozen=True)
@@ -24,6 +27,8 @@ class SkillStep:
     intent: str = ""
     explanation: str = ""
     confirm: bool = True
+    timeout_seconds: int | None = None
+    on_failure: str = "abort"
 
 
 @dataclass(frozen=True)
@@ -37,3 +42,5 @@ class TemplateSkill:
     source_path: Path
     enabled: bool = True
     safety: dict[str, Any] = field(default_factory=dict)
+    version: str = "1"
+    definition_hash: str = ""

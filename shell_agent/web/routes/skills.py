@@ -9,11 +9,12 @@ from fastapi import APIRouter
 
 from shell_agent.core.models import AuditRecord
 from shell_agent.safety.audit import write_audit
-from shell_agent.skills import load_template_skills
+from shell_agent.safety.classifier import classify_command
+from shell_agent.skills import load_template_skills, match_template_skill
 from shell_agent.skills.loader import DEFAULT_TEMPLATE_SKILLS_DIR, parse_template_skill_data
 from shell_agent.skills.models import TemplateSkill
 from shell_agent.web.runtime import get_runtime
-from shell_agent.web.schemas import SkillYamlUpdate
+from shell_agent.web.schemas import SkillPreviewRequest, SkillYamlUpdate
 
 
 router = APIRouter()
@@ -23,6 +24,44 @@ router = APIRouter()
 async def list_skills() -> dict:
     skills = [_skill_payload(skill) for skill in load_template_skills(include_disabled=True)]
     return {"skills": skills}
+
+
+@router.post("/api/skills/preview")
+async def preview_skill(request: SkillPreviewRequest) -> dict:
+    """Render a Skill without persisting or executing it."""
+    try:
+        skill = _parse_skill_yaml(request.yaml)
+        rt = get_runtime()
+        aliases = list(getattr(rt, "servers", {}).keys())
+        match = match_template_skill(
+            request.input,
+            server_aliases=aliases,
+            default_target=request.target or (aliases[0] if aliases else ""),
+            skills=[skill],
+        )
+        if not match:
+            return {"ok": False, "error": "测试输入未命中该 Skill 的触发词"}
+        steps = []
+        for index, step in enumerate(match.steps, start=1):
+            command = str(step.get("command") or "")
+            risk = classify_command(command)
+            steps.append({
+                **step,
+                "index": index,
+                "risk_level": risk.level.value,
+                "risk_reasons": risk.reasons,
+                "will_execute": False,
+            })
+        return {
+            "ok": True,
+            "skill": _skill_payload(skill, detail=True),
+            "params": match.params,
+            "missing_params": match.missing_params,
+            "steps": steps,
+            "will_execute": False,
+        }
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
 
 
 @router.get("/api/skills/{skill_name}")
@@ -82,6 +121,8 @@ async def delete_skill(skill_name: str) -> dict:
 def _skill_payload(skill: TemplateSkill, detail: bool = False) -> dict:
     payload = {
         "name": skill.name,
+        "version": skill.version,
+        "definition_hash": skill.definition_hash,
         "description": skill.description,
         "category": skill.category,
         "triggers": skill.triggers,
@@ -94,6 +135,9 @@ def _skill_payload(skill: TemplateSkill, detail: bool = False) -> dict:
                 "description": param.description,
                 "pattern": param.pattern,
                 "enum": param.enum,
+                "extract": param.extract,
+                "minimum": param.minimum,
+                "maximum": param.maximum,
             }
             for param in skill.params
         ],
@@ -109,6 +153,8 @@ def _skill_payload(skill: TemplateSkill, detail: bool = False) -> dict:
                 "intent": step.intent,
                 "explanation": step.explanation,
                 "confirm": step.confirm,
+                "timeout_seconds": step.timeout_seconds,
+                "on_failure": step.on_failure,
             }
             for step in skill.steps
         ]

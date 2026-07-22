@@ -41,6 +41,19 @@ def mask_credential(item: dict) -> dict:
     }
 
 
+def _servers_referencing_credential(credential_id: str) -> list[str]:
+    path = Path("config/inventory.yaml")
+    if not path.exists():
+        return []
+    with path.open(encoding="utf-8") as stream:
+        data = yaml.safe_load(stream) or {}
+    return [
+        str(item.get("alias") or "未命名服务器")
+        for item in data.get("servers", [])
+        if item.get("ssh_credential") == credential_id
+    ]
+
+
 @router.get("/api/credentials")
 async def list_credentials() -> dict:
     data = read_credentials_file()
@@ -87,6 +100,12 @@ async def upsert_credential(credential: CredentialUpsert) -> dict:
 @router.delete("/api/credentials/{credential_id}")
 async def delete_credential(credential_id: str) -> dict:
     rt = get_runtime()
+    references = _servers_referencing_credential(credential_id)
+    if references:
+        return {
+            "ok": False,
+            "error": f"凭证 {credential_id} 仍被服务器引用: {', '.join(references)}",
+        }
     data = read_credentials_file()
     before = len(data.get("credentials", []))
     data["credentials"] = [

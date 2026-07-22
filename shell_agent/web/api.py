@@ -4,8 +4,8 @@ from __future__ import annotations
 import asyncio
 from datetime import datetime
 import re
-import shlex
 from typing import Optional
+from urllib.parse import urlsplit
 from uuid import uuid4
 
 from fastapi import APIRouter, HTTPException, WebSocket, WebSocketDisconnect
@@ -21,6 +21,7 @@ from shell_agent.safety.audit import write_audit
 from shell_agent.safety.classifier import RiskLevel, classify_command
 from shell_agent.safety.policy import evaluate_environment_policy
 from shell_agent.skills import load_template_skills, match_template_skill
+from shell_agent.skills.discovery import discover_skill_candidates
 from shell_agent.storage.sessions import (
     add_session_message,
     ensure_session,
@@ -49,6 +50,7 @@ from shell_agent.web.routes.knowledge import router as knowledge_router
 from shell_agent.web.routes.memories import router as memories_router
 from shell_agent.web.routes.safety import router as safety_router
 from shell_agent.web.routes.sessions import (
+    _restore_pending_command_from_task,
     _session_pending_state,
     _session_task_state,
     router as sessions_router,
@@ -62,6 +64,7 @@ from shell_agent.web.routes.file_transfers import (
 )
 from shell_agent.web.routes.deployment_runs import router as deployment_runs_router
 from shell_agent.web.routes.skills import router as skills_router
+from shell_agent.web.routes.skill_candidates import router as skill_candidates_router
 from shell_agent.web.routes.state import router as state_router
 from shell_agent.web.schemas import (
     ChatRequest,
@@ -131,6 +134,7 @@ router.include_router(config_router)
 router.include_router(inventory_router)
 router.include_router(knowledge_router)
 router.include_router(skills_router)
+router.include_router(skill_candidates_router)
 router.include_router(safety_router)
 router.include_router(sessions_router)
 router.include_router(session_files_router)
@@ -142,6 +146,9 @@ router.include_router(deployment_runs_router)
 @router.websocket("/ws/chat")
 async def chat_ws(websocket: WebSocket) -> None:
     """聊天 WebSocket：双向通信"""
+    if not _websocket_origin_allowed(websocket):
+        await websocket.close(code=1008, reason="不允许的 WebSocket Origin")
+        return
     await manager.connect(websocket)
     rt = get_runtime()
     session_id = f"ws_{datetime.now().strftime('%H%M%S')}"
@@ -258,7 +265,7 @@ async def _send_session_sync(
         session = await get_session(rt.db, session_id, message_limit=200)
         if session:
             messages = list(session.get("messages") or [])
-    pending = _session_pending_state(rt, session_id)
+    pending = await _session_pending_state(rt, session_id)
     if getattr(rt, "db", None):
         waiting_transfer = await get_waiting_file_transfer(rt.db, session_id)
         if waiting_transfer:
@@ -669,6 +676,11 @@ async def _handle_chat_message_with_turn(
         await _send_turn_state(websocket, rt, session_id, turn_id, "completed", "已回复", completed=True)
         return
 
+    if await _try_skill_history_discovery(
+        websocket, rt, session_id, message, turn_id
+    ):
+        return
+
     if _is_artifact_deploy_request(message) and not context.latest_artifact():
         content = (
             "当前会话还没有已传到服务器的文件。请先在聊天中上传文件，"
@@ -701,7 +713,7 @@ async def _handle_chat_message_with_turn(
         return
 
     await _send_turn_state(websocket, rt, session_id, turn_id, "thinking", "正在生成命令")
-    await _send(websocket, "system", content="正在生成命令...")
+    await _send(websocket, "system", content="正在生成命令...", transient=True)
 
     try:
         memory_history = await _memory_history_for_input(rt, message, target)
@@ -904,6 +916,7 @@ async def _try_template_skill(
     command.max_steps = len(match.steps)
     command.skill_name = match.skill.name
     command.step_name = first_step.get("skill_step_name", "")
+    _apply_skill_step_metadata(command, first_step)
 
     await _preview_and_apply_policy(
         websocket=websocket,
@@ -915,6 +928,111 @@ async def _try_template_skill(
         explanation=command.explanation,
         channel="chat",
     )
+    return True
+
+
+def _is_skill_history_discovery_request(message: str) -> bool:
+    text = (message or "").strip().lower()
+    has_history = any(word in text for word in ("历史", "会话", "过去", "最近"))
+    has_skill = "skill" in text or "技能" in text
+    has_action = any(word in text for word in ("扫描", "总结", "提炼", "沉淀", "发现", "生成候选"))
+    return has_history and has_skill and has_action
+
+
+async def _try_skill_history_discovery(
+    websocket: WebSocket,
+    rt,
+    session_id: str,
+    message: str,
+    turn_id: str,
+) -> bool:
+    if not _is_skill_history_discovery_request(message):
+        return False
+    if not getattr(rt, "db", None):
+        content = "数据库未初始化，无法扫描历史任务。"
+        await _send(websocket, "system", content=content)
+        await _send_turn_state(websocket, rt, session_id, turn_id, "failed", "扫描失败", completed=True)
+        return True
+    day_match = re.search(r"(\d{1,3})\s*天", message)
+    days = max(1, min(int(day_match.group(1)), 365)) if day_match else 30
+    occurrence_match = re.search(r"至少\s*(\d{1,2})\s*次", message)
+    min_occurrences = (
+        max(2, min(int(occurrence_match.group(1)), 20))
+        if occurrence_match
+        else 3
+    )
+    semantic = "精确" not in message
+    await _send_turn_state(websocket, rt, session_id, turn_id, "analyzing", "正在扫描历史任务")
+    result = await discover_skill_candidates(
+        rt.db,
+        days=days,
+        min_occurrences=min_occurrences,
+        secret_values=rt.secret_values() if hasattr(rt, "secret_values") else [],
+        semantic=semantic,
+        llm=getattr(rt, "llm", None),
+    )
+    candidates = result["created"]
+    existing = result["existing"]
+    lines = [
+        f"## Skill 候选扫描完成",
+        "",
+        f"- 扫描范围：最近 {days} 天",
+        f"- 符合分析条件的成功任务：{result['scanned_tasks']} 个",
+        f"- 重复流程组：{result['repeated_groups']} 个",
+        f"- 精确分组：{result.get('exact_groups', 0)} 个",
+        f"- 语义分组：{result.get('semantic_groups', 0)} 个",
+        f"- 新建候选：{len(candidates)} 个",
+        f"- 已存在候选：{len(existing)} 个",
+    ]
+    semantic_state = result.get("semantic") or {}
+    if semantic:
+        status = str(semantic_state.get("status") or "unavailable")
+        status_text = {
+            "completed": "已完成",
+            "unavailable": "当前未配置可用模型，已退回精确扫描",
+            "failed": "模型分组失败，已退回精确扫描",
+            "insufficient_data": "可参与语义分组的任务不足",
+        }.get(status, status)
+        lines.append(f"- 语义扫描状态：{status_text}")
+    if candidates:
+        lines.extend(["", "### 新候选"])
+        for index, candidate in enumerate(candidates, start=1):
+            lines.extend(
+                [
+                    f"{index}. **{candidate['name']}**",
+                    f"   - {candidate.get('description') or ''}",
+                    f"   - 出现 {candidate.get('occurrence_count') or 0} 次；风险 {candidate.get('risk_level') or 'unknown'}；置信度 {float(candidate.get('confidence') or 0):.0%}",
+                ]
+            )
+        lines.extend(["", "候选不会自动执行或启用，请到“配置 → Skills → 历史候选”审核。"])
+    elif not existing:
+        lines.extend(
+            [
+                "",
+                f"没有达到“至少 {min_occurrences} 次、全部步骤成功、命令结构一致”的流程。",
+                "一次性排查、失败任务、Critical 命令、已有 Skill 执行记录和无法确定性编译的语义分组不会生成候选。",
+            ]
+        )
+    content = "\n".join(lines)
+    await _send(websocket, "agent", content=content)
+    await _persist_session_message(
+        rt,
+        session_id,
+        "agent",
+        "agent",
+        content=content,
+        payload={
+            "skill_candidate_scan": {
+                "days": days,
+                "min_occurrences": min_occurrences,
+                "candidate_ids": [item.get("id") for item in candidates],
+                "semantic": semantic,
+                "semantic_status": semantic_state.get("status"),
+            }
+        },
+        session_type="chat",
+    )
+    await _send_turn_state(websocket, rt, session_id, turn_id, "completed", "扫描完成", completed=True)
     return True
 
 
@@ -1095,7 +1213,7 @@ async def _handle_plan_adjust(
         content=user_adjustment,
         session_type="chat",
     )
-    await _send(websocket, "system", content="正在调整方案...")
+    await _send(websocket, "system", content="正在调整方案...", transient=True)
     try:
         result = await rt.llm.revise_operation_plan(
             user_input=plan.get("user_input", ""),
@@ -1158,7 +1276,12 @@ async def _handle_plan_confirm(
         rt.running_task_ids[owner_key] = turn_id
     turn_token = _SEND_TURN_ID.set(plan.get("turn_id", ""))
     try:
-        await _send(websocket, "system", content="方案已确认，正在生成命令步骤...")
+        await _send(
+            websocket,
+            "system",
+            content="方案已确认，正在生成命令步骤...",
+            transient=True,
+        )
         if plan.get("turn_id"):
             await _send_turn_state(websocket, rt, session_id, plan["turn_id"], "thinking", "正在生成命令步骤")
         steps = plan.get("steps") or []
@@ -1226,7 +1349,8 @@ async def _handle_confirm(
     request_id: str = "",
 ) -> None:
     """Handle a scoped, idempotent command confirmation request."""
-    requested_task_id = (task_id or operation_id or "").strip()
+    requested_operation_id = (operation_id or "").strip()
+    requested_task_id = (task_id or requested_operation_id or "").strip()
     command = _get_pending_command(rt, session_id, channel, requested_task_id)
     if not command:
         command = await _restore_pending_command_from_task(
@@ -1276,6 +1400,24 @@ async def _handle_confirm(
         return
 
     requested_task_id = command.task_id or requested_task_id
+    if requested_operation_id and requested_operation_id not in {
+        requested_task_id,
+        command.id,
+    }:
+        await _send_confirm_ack(
+            websocket,
+            session_id=session_id,
+            channel=channel,
+            task_id=requested_task_id,
+            operation_id=requested_operation_id,
+            request_id=request_id,
+            confirmed=confirmed,
+            accepted=False,
+            duplicate=False,
+            status="stale",
+            content="待确认命令已变化，请确认当前步骤",
+        )
+        return
     if command.requires_secondary_confirm:
         expected = command.secondary_confirm_expected.strip()
         actual = (secondary_confirm_value or "").strip()
@@ -1491,7 +1633,7 @@ async def _preview_and_apply_policy(
     """发送命令预览，并按 Web 端确认模式决定下一步。"""
     if channel == "chat" and not command.task_id and _SEND_TURN_ID.get():
         command.task_id = _SEND_TURN_ID.get()
-    mode = _parse_confirm_mode(confirm_mode)
+    mode = _parse_confirm_mode(_effective_skill_confirm_mode(command, confirm_mode))
     command.confirm_mode = mode.value
     risk = classify_command(command.actual_command)
     policy = evaluate_environment_policy(
@@ -1516,6 +1658,7 @@ async def _preview_and_apply_policy(
         pending_command=_display_command(command),
         pending_target=command.target,
         confirm_mode=mode.value,
+        workflow_snapshot=_command_workflow_snapshot(command),
     )
     _get_session_context(rt, session_id).add_generated_command(
         command,
@@ -1597,7 +1740,13 @@ async def _preview_and_apply_policy(
             )
             await _update_command_task(rt, command, status="blocked", completed=True)
             return
-        await _send(websocket, "system", content="完全访问模式：命令自动执行", channel=channel)
+        await _send(
+            websocket,
+            "system",
+            content="完全访问模式：命令自动执行",
+            channel=channel,
+            transient=True,
+        )
         await _update_command_task(rt, command, status="running")
         if channel == "chat":
             await _send_turn_state(websocket, rt, session_id, command.task_id, "executing", "正在执行命令")
@@ -1629,7 +1778,13 @@ async def _preview_and_apply_policy(
         return
 
     if mode == ConfirmMode.AUTO_SAFE and risk.level == RiskLevel.SAFE:
-        await _send(websocket, "system", content="自动安全模式：安全命令自动执行", channel=channel)
+        await _send(
+            websocket,
+            "system",
+            content="自动安全模式：安全命令自动执行",
+            channel=channel,
+            transient=True,
+        )
         await _update_command_task(rt, command, status="running")
         if channel == "chat":
             await _send_turn_state(websocket, rt, session_id, command.task_id, "executing", "正在执行命令")
@@ -1639,16 +1794,23 @@ async def _preview_and_apply_policy(
 
     rt.pending_commands[_pending_key(session_id, channel)] = command
     if mode == ConfirmMode.AUTO_SAFE:
-        await _send(websocket, "system", content="自动安全模式：该风险等级需要人工确认", channel=channel)
-        await _persist_session_message(
-            rt,
-            session_id,
-            "system",
+        await _send(
+            websocket,
             "system",
             content="自动安全模式：该风险等级需要人工确认",
-            payload={"channel": channel},
-            session_type="command" if channel == "command" else "chat",
+            channel=channel,
+            transient=True,
         )
+        if channel == "command":
+            await _persist_session_message(
+                rt,
+                session_id,
+                "system",
+                "system",
+                content="自动安全模式：该风险等级需要人工确认",
+                payload={"channel": channel},
+                session_type="command",
+            )
     await _send(websocket, "confirm_prompt", content="确认执行? [y/n]", channel=channel)
 
 
@@ -1684,38 +1846,6 @@ async def _get_waiting_confirm_task(rt, session_id: str, channel: str) -> dict |
         if task.get("status") == "waiting_confirm" and task.get("pending_command"):
             return task
     return None
-
-
-async def _restore_pending_command_from_task(
-    rt,
-    session_id: str,
-    channel: str,
-    task_id: str = "",
-) -> PendingCommand | None:
-    if not task_id or not getattr(rt, "db", None) or not getattr(rt, "executor", None):
-        return None
-    task = await get_task(rt.db, task_id)
-    if (
-        not task
-        or task.get("session_id") != session_id
-        or task.get("channel") != channel
-        or task.get("status") != "waiting_confirm"
-        or not task.get("pending_command")
-        or not task.get("pending_target")
-    ):
-        return None
-    try:
-        command = rt.executor.normalize(
-            f"ssh {task['pending_target']} {shlex.quote(task['pending_command'])}"
-        )
-    except ValueError:
-        return None
-    command.source = "llm"
-    command.user_input = task.get("title") or ""
-    command.intent = task.get("title") or ""
-    command.confirm_mode = task.get("confirm_mode") or ConfirmMode.INTERACTIVE.value
-    command.task_id = task["id"]
-    return command
 
 
 async def _get_scoped_task(
@@ -1835,7 +1965,7 @@ def _get_pending_command(
     )
     if not command:
         return None
-    if task_id and command.task_id != task_id:
+    if task_id and task_id not in {command.task_id, command.id}:
         return None
     return command
 
@@ -1865,13 +1995,20 @@ def _command_preview_payload(
     return {
         "session_id": session_id,
         "task_id": command.task_id,
+        "operation_id": command.id,
         "turn_id": command.task_id if channel == "chat" else "",
         "channel": channel,
+        "step_index": command.step_index,
+        "total_steps": _task_total_steps(command),
         "command": _display_command(command),
         "target": command.target,
         "cwd": context.get_cwd(command.target),
         "intent": command.intent,
         "explanation": command.explanation,
+        "skill_name": command.skill_name,
+        "skill_version": command.skill_version,
+        "skill_hash": command.skill_hash,
+        "skill_step_name": command.step_name,
         "confirm_mode": command.confirm_mode,
         "policy_blocked": command.policy_blocked,
         "policy_block_reason": command.policy_block_reason,
@@ -2375,6 +2512,17 @@ async def _maybe_analyze_execution_result(
 
     output_summary = f"执行结果摘要:\n{compact_text(_result_output(result), limit=2000)}"
     if command.source == "skill":
+        if not _result_success(result) and command.skill_on_failure != "continue":
+            await _fail_chat_task(
+                websocket,
+                rt,
+                session_id,
+                command,
+                f"Skill 步骤「{command.step_name or command.step_index}」执行失败，已停止后续步骤",
+            )
+            return True
+        if not _result_success(result):
+            command.skill_had_failures = True
         if command.step_queue:
             await _maybe_plan_next_step(
                 websocket=websocket,
@@ -2386,7 +2534,12 @@ async def _maybe_analyze_execution_result(
             )
             return True
         if _is_task_command(command):
-            await _send_task_complete(websocket, rt, session_id, command, "Skill 任务已完成")
+            content = (
+                "Skill 任务部分完成：至少一个步骤失败"
+                if command.skill_had_failures
+                else "Skill 任务已完成"
+            )
+            await _send_task_complete(websocket, rt, session_id, command, content)
             return True
         return False
 
@@ -2421,7 +2574,13 @@ async def _maybe_analyze_execution_result(
         "analyzing",
         "正在分析结果",
     )
-    await _send(websocket, "system", content="正在分析结果...", channel=channel)
+    await _send(
+        websocket,
+        "system",
+        content="正在分析结果...",
+        channel=channel,
+        transient=True,
+    )
     try:
         analysis = await rt.llm.analyze_execution_result(
             user_input=command.user_input or command.intent,
@@ -2498,7 +2657,13 @@ async def _maybe_summarize_single_chat_result(
         "analyzing",
         "正在生成结论",
     )
-    await _send(websocket, "system", content="正在生成最终结论...", channel="chat")
+    await _send(
+        websocket,
+        "system",
+        content="正在生成最终结论...",
+        channel="chat",
+        transient=True,
+    )
     task_outputs = "\n".join(
         [
             "Step 1",
@@ -2622,7 +2787,7 @@ async def _maybe_plan_next_step(
         next_step = command.step_queue[0]
         try:
             pending = rt.executor.normalize(next_step["command"])
-            pending.source = "llm"
+            pending.source = "skill" if command.source == "skill" else "llm"
             pending.user_input = command.user_input
             pending.intent = next_step.get("intent", "")
             pending.explanation = next_step.get("explanation", "")
@@ -2634,6 +2799,12 @@ async def _maybe_plan_next_step(
             pending.task_id = command.task_id
             pending.skill_name = command.skill_name
             pending.step_name = next_step.get("skill_step_name", "")
+            if pending.source == "skill":
+                pending.skill_version = command.skill_version
+                pending.skill_hash = command.skill_hash
+                pending.skill_default_confirm_mode = command.skill_default_confirm_mode
+                pending.skill_had_failures = command.skill_had_failures
+                _apply_skill_step_metadata(pending, next_step)
         except ValueError as e:
             await _fail_chat_task(
                 websocket,
@@ -2675,7 +2846,13 @@ async def _maybe_plan_next_step(
         "analyzing",
         "正在判断下一步",
     )
-    await _send(websocket, "system", content="正在判断是否需要继续下一步...", channel="chat")
+    await _send(
+        websocket,
+        "system",
+        content="正在判断是否需要继续下一步...",
+        channel="chat",
+        transient=True,
+    )
     try:
         decision = await rt.llm.decide_next_step(
             user_input=command.user_input or command.intent,
@@ -2879,13 +3056,23 @@ async def _send_task_complete(
         "analyzing",
         "正在生成最终结论",
     )
-    await _send(websocket, "system", content="正在生成最终结论...", channel="chat")
+    await _send(
+        websocket,
+        "system",
+        content="正在生成最终结论...",
+        channel="chat",
+        transient=True,
+    )
     final_content = await _build_final_task_conclusion(
         rt,
         session_id,
         command,
         content,
     )
+    if command.skill_had_failures:
+        warning = "⚠️ Skill 任务部分完成：至少一个步骤失败。"
+        if warning not in final_content:
+            final_content = f"{warning}\n\n{final_content}".strip()
     payload = {
         "task_id": command.task_id,
         "turn_id": command.task_id,
@@ -2898,7 +3085,8 @@ async def _send_task_complete(
         "command": "",
         "target": command.target,
     }
-    await _update_command_task(rt, command, status="success", completed=True)
+    terminal_status = "partial" if command.skill_had_failures else "success"
+    await _update_command_task(rt, command, status=terminal_status, completed=True)
     await _send(websocket, "task_step", **payload)
     await _persist_task_event(
         rt,
@@ -2920,14 +3108,20 @@ async def _send_task_complete(
         payload=payload,
         session_type="chat",
     )
-    await _send_turn_state(websocket, rt, session_id, command.task_id, "completed", "任务完成", completed=True)
-    _schedule_task_learning(
-        rt,
-        task_id=command.task_id,
-        session_id=session_id,
-        user_input=command.user_input or command.intent,
-        final_summary=final_content,
+    turn_label = "任务部分完成" if command.skill_had_failures else "任务完成"
+    await _send_turn_state(
+        websocket, rt, session_id, command.task_id, "completed", turn_label, completed=True
     )
+    if command.skill_had_failures:
+        await _update_command_task(rt, command, status="partial", completed=True)
+    else:
+        _schedule_task_learning(
+            rt,
+            task_id=command.task_id,
+            session_id=session_id,
+            user_input=command.user_input or command.intent,
+            final_summary=final_content,
+        )
 
 
 async def _fail_chat_task(
@@ -3154,6 +3348,101 @@ def _parse_confirm_mode(confirm_mode: str) -> ConfirmMode:
         return ConfirmMode.INTERACTIVE
 
 
+_CONFIRM_MODE_RANK = {
+    ConfirmMode.FULL_ACCESS.value: 0,
+    ConfirmMode.AUTO_SAFE.value: 1,
+    ConfirmMode.INTERACTIVE.value: 2,
+}
+
+
+def _effective_skill_confirm_mode(command: PendingCommand, requested: str) -> str:
+    """Skill 只能收紧用户选择的确认模式，不能放宽。"""
+    requested_mode = _parse_confirm_mode(requested)
+    if command.source != "skill" and not command.skill_name:
+        return requested_mode.value
+    if requested_mode == ConfirmMode.DRY_RUN:
+        return requested_mode.value
+    if command.skill_force_confirm:
+        return ConfirmMode.INTERACTIVE.value
+    default_mode = _parse_confirm_mode(command.skill_default_confirm_mode)
+    if default_mode == ConfirmMode.DRY_RUN:
+        return default_mode.value
+    requested_rank = _CONFIRM_MODE_RANK.get(requested_mode.value, 2)
+    default_rank = _CONFIRM_MODE_RANK.get(default_mode.value, 2)
+    return requested_mode.value if requested_rank >= default_rank else default_mode.value
+
+
+def _apply_skill_step_metadata(command: PendingCommand, step: dict) -> None:
+    command.skill_name = str(step.get("skill_name") or command.skill_name or "")
+    command.skill_version = str(step.get("skill_version") or command.skill_version or "")
+    command.skill_hash = str(step.get("skill_hash") or command.skill_hash or "")
+    command.skill_default_confirm_mode = str(
+        step.get("skill_default_confirm_mode")
+        or command.skill_default_confirm_mode
+        or ConfirmMode.INTERACTIVE.value
+    )
+    command.skill_force_confirm = bool(step.get("confirm", True))
+    failure_policy = str(step.get("on_failure") or "abort")
+    command.skill_on_failure = failure_policy if failure_policy in {"abort", "continue"} else "abort"
+    timeout = step.get("timeout_seconds")
+    command.timeout_seconds = int(timeout) if timeout is not None else None
+
+
+def _command_workflow_snapshot(command: PendingCommand) -> dict:
+    return {
+        "operation_id": command.id,
+        "source": command.source,
+        "user_input": command.user_input,
+        "intent": command.intent,
+        "explanation": command.explanation,
+        "response_mode": command.response_mode,
+        "step_index": command.step_index,
+        "max_steps": command.max_steps,
+        "step_queue": command.step_queue,
+        "skill_name": command.skill_name,
+        "skill_version": command.skill_version,
+        "skill_hash": command.skill_hash,
+        "skill_default_confirm_mode": command.skill_default_confirm_mode,
+        "skill_force_confirm": command.skill_force_confirm,
+        "skill_on_failure": command.skill_on_failure,
+        "skill_had_failures": command.skill_had_failures,
+        "step_name": command.step_name,
+        "timeout_seconds": command.timeout_seconds,
+        "policy_blocked": command.policy_blocked,
+        "policy_block_reason": command.policy_block_reason,
+        "requires_secondary_confirm": command.requires_secondary_confirm,
+        "secondary_confirm_expected": command.secondary_confirm_expected,
+        "secondary_confirm_label": command.secondary_confirm_label,
+        "secondary_confirm_reason": command.secondary_confirm_reason,
+    }
+
+
+def _websocket_origin_allowed(websocket: WebSocket) -> bool:
+    """Accept same-origin browsers and non-browser local clients only."""
+    headers = getattr(websocket, "headers", None)
+    if headers is None:
+        return True
+    origin = str(headers.get("origin") or "").strip()
+    if not origin:
+        return True
+    host = str(headers.get("host") or "").strip().lower()
+    try:
+        parsed = urlsplit(origin)
+    except ValueError:
+        return False
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        return False
+    if parsed.netloc.lower() == host:
+        return True
+    origin_host = (parsed.hostname or "").lower()
+    try:
+        request_host = (urlsplit(f"//{host}").hostname or "").lower()
+    except ValueError:
+        return False
+    loopback_hosts = {"127.0.0.1", "localhost", "::1"}
+    return origin_host in loopback_hosts and request_host in loopback_hosts
+
+
 def _preview_needs_confirmation(mode: ConfirmMode, risk_level: RiskLevel) -> bool:
     if mode in (ConfirmMode.DRY_RUN, ConfirmMode.FULL_ACCESS):
         return False
@@ -3165,7 +3454,10 @@ def _preview_needs_confirmation(mode: ConfirmMode, risk_level: RiskLevel) -> boo
 async def _execute(rt, command: PendingCommand, session_id: str) -> ExecutionResult:
     """执行命令"""
     try:
-        result = await rt.executor.execute(command)
+        if command.timeout_seconds is not None and hasattr(rt.executor, "default_timeout"):
+            result = await rt.executor.execute(command, timeout=command.timeout_seconds)
+        else:
+            result = await rt.executor.execute(command)
     except Exception as e:
         logger.exception("执行器异常")
         result = ExecutionResult(

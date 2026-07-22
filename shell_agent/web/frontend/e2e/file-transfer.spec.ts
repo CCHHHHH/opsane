@@ -32,7 +32,10 @@ async function beginTransfer(page: Page) {
 }
 
 test.describe('session file transfer uses an isolated fake backend', () => {
-  test.beforeEach(async ({ request }) => {
+  test.beforeEach(async ({ request, page }) => {
+    await page.addInitScript(() => {
+      localStorage.setItem('opsane:onboarding:v1', '1')
+    })
     await resetTransfers(request)
   })
 

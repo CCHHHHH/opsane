@@ -1,20 +1,28 @@
 """Server inventory and service-profile REST endpoints."""
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime
 from pathlib import Path
 import re
+import time
 from uuid import uuid4
 
 import yaml
 from fastapi import APIRouter
+from loguru import logger
 
+from shell_agent.core.models import PendingCommand
+from shell_agent.executors.ssh import SSHExecutor
+from shell_agent.utils.config import ServerEntry
 from shell_agent.web.routes.credentials import mask_credential, read_credentials_file
 from shell_agent.web.runtime import get_runtime
 from shell_agent.web.schemas import ServerCreate, ServiceProfileUpsert
 
 
 router = APIRouter()
+SERVER_CONNECTION_TEST_TIMEOUT_SECONDS = 12
+SERVER_CONNECTION_TEST_MARKER = "__opsane_ssh_ready__"
 
 
 def inventory_path() -> Path:
@@ -49,6 +57,28 @@ def write_inventory_file(data: dict) -> None:
         raise
 
 
+def _services_referencing_server(data: dict, alias: str) -> list[str]:
+    return [
+        str(item.get("name") or item.get("id") or "未命名服务")
+        for item in data.get("services", [])
+        if alias in (item.get("servers") or [])
+    ]
+
+
+def _replace_server_references(data: dict, old_alias: str, new_alias: str) -> None:
+    for service in data.get("services", []):
+        servers = list(service.get("servers") or [])
+        if old_alias not in servers:
+            continue
+        service["servers"] = list(
+            dict.fromkeys(new_alias if alias == old_alias else alias for alias in servers)
+        )
+        try:
+            service["revision"] = max(1, int(service.get("revision") or 1)) + 1
+        except (TypeError, ValueError):
+            service["revision"] = 2
+
+
 @router.get("/api/servers")
 async def list_servers() -> dict:
     rt = get_runtime()
@@ -76,6 +106,91 @@ async def list_servers() -> dict:
     return {"servers": servers}
 
 
+async def _probe_server_connection(rt, server: ServerCreate) -> dict:
+    alias = server.alias.strip()
+    host = server.host.strip()
+    credential_id = server.ssh_credential.strip()
+    if not alias:
+        return {"ok": False, "error": "服务器别名必填"}
+    if not host:
+        return {"ok": False, "error": "服务器主机地址必填"}
+    if not 1 <= server.port <= 65535:
+        return {"ok": False, "error": "SSH 端口必须在 1 到 65535 之间"}
+    credential = rt.credentials.get(credential_id)
+    if credential is None:
+        return {"ok": False, "error": f"SSH 凭证 {credential_id or '-'} 不存在"}
+
+    entry = ServerEntry(
+        **{
+            **server.model_dump(),
+            "alias": alias,
+            "host": host,
+            "ssh_credential": credential_id,
+        }
+    )
+    timeout = min(
+        max(1, int(rt.config.ssh.default_timeout)),
+        SERVER_CONNECTION_TEST_TIMEOUT_SECONDS,
+    )
+    executor = SSHExecutor(
+        servers={alias: entry},
+        credentials={credential_id: credential},
+        max_per_host=1,
+        idle_timeout=rt.config.ssh.idle_timeout,
+        total_max=1,
+        default_timeout=timeout,
+        trust_unknown_hosts=rt.config.ssh.trust_unknown_hosts,
+    )
+    command = PendingCommand(
+        raw=f"ssh {alias} 'printf {SERVER_CONNECTION_TEST_MARKER}'",
+        target=alias,
+        target_env=entry.env,
+        executor="ssh",
+        actual_command=f"printf {SERVER_CONNECTION_TEST_MARKER}",
+        source="system",
+        intent="测试 SSH 连通性",
+    )
+    started_at = time.monotonic()
+    try:
+        result = await asyncio.wait_for(
+            executor.execute(command, timeout=timeout),
+            timeout=timeout + 1,
+        )
+    except asyncio.TimeoutError:
+        return {"ok": False, "error": f"SSH 连接超时（{timeout} 秒）"}
+    except Exception as error:
+        detail = re.sub(r"\s+", " ", str(error)).strip()[:240]
+        logger.warning("SSH 连通性测试失败: alias={} error={}", alias, detail)
+        return {
+            "ok": False,
+            "error": f"SSH 连接失败：{detail or error.__class__.__name__}",
+        }
+    finally:
+        await executor.close_all()
+
+    latency_ms = max(0, int((time.monotonic() - started_at) * 1000))
+    if result.timed_out:
+        return {"ok": False, "error": f"SSH 探测命令超时（{timeout} 秒）"}
+    if result.exit_code != 0:
+        detail = re.sub(r"\s+", " ", result.stderr or "").strip()[:240]
+        return {
+            "ok": False,
+            "error": f"SSH 探测失败：{detail or f'exit {result.exit_code}'}",
+        }
+    if SERVER_CONNECTION_TEST_MARKER not in result.stdout:
+        return {"ok": False, "error": "SSH 已连接，但探测结果不完整"}
+    return {
+        "ok": True,
+        "message": f"SSH 连接成功（{latency_ms} ms）",
+        "latency_ms": latency_ms,
+    }
+
+
+@router.post("/api/servers/test-connection")
+async def test_server_connection(server: ServerCreate) -> dict:
+    return await _probe_server_connection(get_runtime(), server)
+
+
 @router.post("/api/servers")
 async def add_server(server: ServerCreate) -> dict:
     rt = get_runtime()
@@ -100,6 +215,8 @@ async def update_server(alias: str, server: ServerCreate) -> dict:
     for index, item in enumerate(data.get("servers", [])):
         if item.get("alias") == alias:
             data["servers"][index] = server.model_dump()
+            if server.alias != alias:
+                _replace_server_references(data, alias, server.alias)
             updated = True
             break
     if not updated:
@@ -115,6 +232,12 @@ async def delete_server(alias: str) -> dict:
     if alias not in rt.servers:
         return {"error": f"别名 {alias} 不存在"}
     data = read_inventory_file()
+    references = _services_referencing_server(data, alias)
+    if references:
+        return {
+            "ok": False,
+            "error": f"服务器 {alias} 仍被服务画像引用: {', '.join(references)}",
+        }
     data["servers"] = [item for item in data.get("servers", []) if item.get("alias") != alias]
     write_inventory_file(data)
     await rt.reload()

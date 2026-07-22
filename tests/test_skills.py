@@ -1,8 +1,10 @@
 import sys
 from pathlib import Path
 
+import pytest
+
 from shell_agent.skills.engine import match_template_skill
-from shell_agent.skills.loader import load_template_skills
+from shell_agent.skills.loader import load_template_skills, parse_template_skill_data
 
 
 def test_loads_template_skills_from_yaml() -> None:
@@ -141,3 +143,63 @@ def test_explicit_missing_skill_path_does_not_fall_back_to_install_prefix(
     monkeypatch.setattr(sys, "prefix", str(install_prefix))
 
     assert load_template_skills(tmp_path / "missing") == []
+
+
+def test_skill_v2_renders_typed_shell_argument_and_step_policy(tmp_path: Path) -> None:
+    skill = parse_template_skill_data(
+        {
+            "name": "service_status",
+            "version": "3",
+            "triggers": ["服务状态"],
+            "params": [
+                {
+                    "name": "service",
+                    "type": "shell_arg",
+                    "required": True,
+                    "extract": r"服务状态\s+(.+)$",
+                }
+            ],
+            "steps": [
+                {
+                    "name": "查询服务",
+                    "command": "systemctl status {{service}}",
+                    "confirm": True,
+                    "timeout_seconds": 17,
+                    "on_failure": "continue",
+                }
+            ],
+            "safety": {"default_confirm_mode": "auto_safe"},
+        },
+        tmp_path / "service_status.yaml",
+    )
+
+    match = match_template_skill(
+        "服务状态 app; touch /tmp/pwned",
+        server_aliases=[],
+        skills=[skill],
+    )
+
+    assert match is not None
+    assert match.steps[0]["command"] == "systemctl status 'app; touch /tmp/pwned'"
+    assert match.steps[0]["confirm"] is True
+    assert match.steps[0]["timeout_seconds"] == 17
+    assert match.steps[0]["on_failure"] == "continue"
+    assert match.steps[0]["skill_version"] == "3"
+    assert len(match.steps[0]["skill_hash"]) == 64
+
+
+def test_skill_rejects_untyped_string_in_command(tmp_path: Path) -> None:
+    skill = parse_template_skill_data(
+        {
+            "name": "unsafe",
+            "triggers": ["运行"],
+            "params": [
+                {"name": "value", "type": "string", "required": True, "extract": r"运行\s+(.+)$"}
+            ],
+            "steps": [{"command": "echo {{value}}"}],
+        },
+        tmp_path / "unsafe.yaml",
+    )
+
+    with pytest.raises(ValueError, match="不能直接插入命令"):
+        match_template_skill("运行 hello", server_aliases=[], skills=[skill])

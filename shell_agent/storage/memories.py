@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import re
-from datetime import datetime
+from datetime import datetime, timedelta
 from uuid import uuid4
 
 import aiosqlite
@@ -11,6 +11,7 @@ import aiosqlite
 
 MEMORY_TYPES = {"fact", "procedure", "preference", "observation"}
 MEMORY_STATUSES = {"inferred", "confirmed", "promoted", "stale", "conflicted"}
+MEMORY_ISSUE_RETENTION_DAYS = 30
 
 
 def _now_iso() -> str:
@@ -309,19 +310,46 @@ async def mark_expired_memories(db: aiosqlite.Connection) -> int:
     return cursor.rowcount
 
 
-async def search_memories(
+async def purge_retired_memory_issues(
     db: aiosqlite.Connection,
-    query: str = "",
+    *,
+    retention_days: int = MEMORY_ISSUE_RETENTION_DAYS,
+    now: datetime | None = None,
+) -> int:
+    """Physically remove stale/conflicted memories after the retention window."""
+    retention_days = max(1, int(retention_days))
+    cutoff = ((now or datetime.now()) - timedelta(days=retention_days)).isoformat(
+        timespec="seconds"
+    )
+    cursor = await db.execute(
+        """
+        DELETE FROM global_memories
+        WHERE status IN ('stale', 'conflicted')
+          AND updated_at <= ?
+        """,
+        (cutoff,),
+    )
+    await db.commit()
+    return cursor.rowcount
+
+
+async def maintain_memories(db: aiosqlite.Connection) -> dict[str, int]:
+    """Apply expiry transitions and the 30-day issue retention policy."""
+    expired = await mark_expired_memories(db)
+    purged = await purge_retired_memory_issues(db)
+    return {"expired": expired, "purged": purged}
+
+
+def _memory_filter(
+    query: str,
     *,
     target: str = "",
     memory_type: str = "",
     status: str = "",
     usable_only: bool = False,
-    limit: int = 8,
-) -> list[dict]:
-    await mark_expired_memories(db)
+) -> tuple[str, list]:
     terms = extract_memory_terms(query)
-    sql = "SELECT * FROM global_memories WHERE deleted_at IS NULL"
+    sql = " FROM global_memories WHERE deleted_at IS NULL"
     params: list = []
     if target:
         sql += " AND (target = ? OR COALESCE(target, '') = '')"
@@ -338,18 +366,64 @@ async def search_memories(
         clauses = []
         for term in terms[:6]:
             like = f"%{term}%"
-            clauses.append("(subject LIKE ? OR predicate LIKE ? OR value LIKE ? OR COALESCE(evidence_summary, '') LIKE ?)")
+            clauses.append(
+                "(subject LIKE ? OR predicate LIKE ? OR value LIKE ? "
+                "OR COALESCE(evidence_summary, '') LIKE ?)"
+            )
             params.extend([like, like, like, like])
         sql += " AND (" + " OR ".join(clauses) + ")"
     elif query.strip():
         like = f"%{query.strip().lower()}%"
         sql += " AND (subject LIKE ? OR predicate LIKE ? OR value LIKE ?)"
         params.extend([like, like, like])
-    sql += " ORDER BY confidence DESC, updated_at DESC LIMIT ?"
-    params.append(max(1, limit))
+    return sql, params
+
+
+async def search_memories(
+    db: aiosqlite.Connection,
+    query: str = "",
+    *,
+    target: str = "",
+    memory_type: str = "",
+    status: str = "",
+    usable_only: bool = False,
+    limit: int = 8,
+    offset: int = 0,
+) -> list[dict]:
+    await maintain_memories(db)
+    where, params = _memory_filter(
+        query,
+        target=target,
+        memory_type=memory_type,
+        status=status,
+        usable_only=usable_only,
+    )
+    sql = "SELECT *" + where + " ORDER BY confidence DESC, updated_at DESC LIMIT ? OFFSET ?"
+    params.extend([max(1, limit), max(0, offset)])
     db.row_factory = aiosqlite.Row
     cursor = await db.execute(sql, params)
     return [dict(row) for row in await cursor.fetchall()]
+
+
+async def count_memories(
+    db: aiosqlite.Connection,
+    query: str = "",
+    *,
+    target: str = "",
+    memory_type: str = "",
+    status: str = "",
+    usable_only: bool = False,
+) -> int:
+    where, params = _memory_filter(
+        query,
+        target=target,
+        memory_type=memory_type,
+        status=status,
+        usable_only=usable_only,
+    )
+    cursor = await db.execute("SELECT COUNT(*)" + where, params)
+    row = await cursor.fetchone()
+    return int(row[0] or 0) if row else 0
 
 
 async def list_memories(
@@ -360,6 +434,7 @@ async def list_memories(
     memory_type: str = "",
     status: str = "",
     target: str = "",
+    offset: int = 0,
 ) -> list[dict]:
     return await search_memories(
         db,
@@ -368,21 +443,38 @@ async def list_memories(
         memory_type=memory_type,
         status=status,
         target=target,
+        offset=offset,
     )
 
 
-async def list_memory_issues(db: aiosqlite.Connection, limit: int = 100) -> list[dict]:
-    await mark_expired_memories(db)
+async def list_memory_issues(
+    db: aiosqlite.Connection,
+    limit: int = 100,
+    *,
+    offset: int = 0,
+) -> list[dict]:
+    await maintain_memories(db)
     db.row_factory = aiosqlite.Row
     cursor = await db.execute(
         """
         SELECT * FROM global_memories
         WHERE deleted_at IS NULL AND status IN ('stale', 'conflicted')
-        ORDER BY updated_at DESC LIMIT ?
+        ORDER BY updated_at DESC LIMIT ? OFFSET ?
         """,
-        (max(1, limit),),
+        (max(1, limit), max(0, offset)),
     )
     return [dict(row) for row in await cursor.fetchall()]
+
+
+async def count_memory_issues(db: aiosqlite.Connection) -> int:
+    cursor = await db.execute(
+        """
+        SELECT COUNT(*) FROM global_memories
+        WHERE deleted_at IS NULL AND status IN ('stale', 'conflicted')
+        """
+    )
+    row = await cursor.fetchone()
+    return int(row[0] or 0) if row else 0
 
 
 async def delete_memory(db: aiosqlite.Connection, memory_id: str) -> bool:

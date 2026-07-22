@@ -30,4 +30,17 @@ describe('HTTP client', () => {
       status: 200,
     }))
   })
+
+  it('uses a structured FastAPI detail message', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(
+      JSON.stringify({ detail: { message: '候选与最新服务画像存在冲突' } }),
+      { status: 409, headers: { 'Content-Type': 'application/json' } },
+    )))
+
+    await expect(http.post('/api/candidate/rebase', {})).rejects.toEqual(expect.objectContaining({
+      name: 'ApiError',
+      message: '候选与最新服务画像存在冲突',
+      status: 409,
+    }))
+  })
 })

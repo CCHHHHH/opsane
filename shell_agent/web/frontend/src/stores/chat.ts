@@ -287,6 +287,7 @@ export const useChatStore = defineStore('chat', {
     },
     confirm(confirmed: boolean, secondaryConfirmValue = '') {
       const taskId = this.pendingPreview?.task_id ?? ''
+      const operationId = this.pendingPreview?.operation_id ?? taskId
       if (!this.sessionId || !taskId || this.confirmingTaskId) return false
       const submitted = workbenchSocket.send({
         type: 'confirm',
@@ -294,7 +295,7 @@ export const useChatStore = defineStore('chat', {
         confirmed,
         channel: 'chat',
         task_id: taskId,
-        operation_id: taskId,
+        operation_id: operationId,
         request_id: `confirm-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`,
         secondary_confirm_value: secondaryConfirmValue,
       })

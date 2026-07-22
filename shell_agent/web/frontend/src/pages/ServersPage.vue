@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { onMounted, reactive, ref } from 'vue'
+import { computed, onMounted, reactive, ref } from 'vue'
 
 import { errorMessage } from '../api/http'
 import type { CredentialRecord, ServerRecord, ServiceRecord } from '../api/protocol'
@@ -9,6 +9,7 @@ import { useInventoryStore, type CredentialInput, type ServerInput, type Service
 import { confirmAction } from '../utils/confirm'
 
 type ResourceTab = 'servers' | 'services' | 'credentials'
+type ServerConnectionState = 'idle' | 'testing' | 'success' | 'error'
 
 const inventory = useInventoryStore()
 const activeTab = ref<ResourceTab>('servers')
@@ -19,6 +20,10 @@ const originalAlias = ref('')
 const originalServiceId = ref('')
 const editingCredential = ref(false)
 const serverTags = ref('')
+const originalServerConnectionFingerprint = ref('')
+const testedServerConnectionFingerprint = ref('')
+const serverConnectionState = ref<ServerConnectionState>('idle')
+const serverConnectionMessage = ref('保存前需要验证 SSH 地址、端口和凭证。')
 const serviceOwners = ref('')
 const servicePorts = ref('')
 const serviceTags = ref('')
@@ -35,6 +40,61 @@ const serviceForm = reactive<ServiceInput>({
   id: '', name: '', env: 'dev', owners: [], servers: [], deploy_dir: '', artifact_path: '', backup_dir: '', artifact_type: 'jar', startup_timeout_seconds: 60, log_dir: '', health_url: '', ports: [], start_cmd: '', stop_cmd: '', restart_cmd: '', status_cmd: '', config_paths: [], runtime: '', version: '', last_verified_at: '', verification_status: 'unknown', source_task_id: '', revision: 1, tags: [], notes: '',
 })
 
+function normalizedServerInput(): ServerInput {
+  return {
+    ...serverForm,
+    alias: serverForm.alias.trim(),
+    host: serverForm.host.trim(),
+    port: Number(serverForm.port),
+    role: serverForm.role.trim(),
+    ssh_credential: serverForm.ssh_credential.trim(),
+    tags: serverTags.value.split(',').map((tag) => tag.trim()).filter(Boolean),
+  }
+}
+
+function serverConnectionFingerprint(input = normalizedServerInput()): string {
+  return JSON.stringify({
+    host: input.host,
+    port: input.port,
+    ssh_credential: input.ssh_credential,
+  })
+}
+
+const serverConnectionReady = computed(() => {
+  const input = normalizedServerInput()
+  return Boolean(
+    input.alias
+    && input.host
+    && input.ssh_credential
+    && Number.isInteger(input.port)
+    && input.port >= 1
+    && input.port <= 65535
+  )
+})
+const displayedServerConnectionState = computed<ServerConnectionState>(() => {
+  if (
+    ['success', 'error'].includes(serverConnectionState.value)
+    && testedServerConnectionFingerprint.value !== serverConnectionFingerprint()
+  ) return 'idle'
+  return serverConnectionState.value
+})
+const displayedServerConnectionMessage = computed(() => {
+  if (displayedServerConnectionState.value === 'idle' && testedServerConnectionFingerprint.value) {
+    return '连接参数已变更，请重新测试。'
+  }
+  return serverConnectionMessage.value
+})
+const serverConnectionVerified = computed(() => (
+  displayedServerConnectionState.value === 'success'
+  && testedServerConnectionFingerprint.value === serverConnectionFingerprint()
+))
+const serverSaveLabel = computed(() => (
+  !originalAlias.value
+  && !serverConnectionVerified.value
+    ? '测试并保存'
+    : '保存'
+))
+
 function openServer(record?: ServerRecord) {
   localError.value = ''
   originalAlias.value = record?.alias ?? ''
@@ -48,20 +108,49 @@ function openServer(record?: ServerRecord) {
     tags: record?.tags ?? [],
   })
   serverTags.value = (record?.tags ?? []).join(', ')
+  originalServerConnectionFingerprint.value = record ? serverConnectionFingerprint() : ''
+  testedServerConnectionFingerprint.value = originalServerConnectionFingerprint.value
+  serverConnectionState.value = 'idle'
+  serverConnectionMessage.value = record
+    ? '仅在修改主机、端口或凭证后需要重新测试。'
+    : '保存前需要验证 SSH 地址、端口和凭证。'
   showServerForm.value = true
+}
+
+async function testServerConnection(input = normalizedServerInput()): Promise<boolean> {
+  localError.value = ''
+  if (!serverConnectionReady.value) {
+    testedServerConnectionFingerprint.value = serverConnectionFingerprint(input)
+    serverConnectionState.value = 'error'
+    serverConnectionMessage.value = '请先完整填写别名、主机、端口和 SSH 凭证。'
+    return false
+  }
+  const fingerprint = serverConnectionFingerprint(input)
+  testedServerConnectionFingerprint.value = fingerprint
+  serverConnectionState.value = 'testing'
+  serverConnectionMessage.value = '正在建立 SSH 连接并执行只读探针…'
+  try {
+    const result = await inventory.testServerConnection(input)
+    serverConnectionState.value = 'success'
+    serverConnectionMessage.value = result.message || 'SSH 连接成功。'
+    return true
+  } catch (error) {
+    serverConnectionState.value = 'error'
+    serverConnectionMessage.value = errorMessage(error)
+    return false
+  }
 }
 
 async function saveServer() {
   localError.value = ''
+  const input = normalizedServerInput()
   try {
-    await inventory.saveServer({
-      ...serverForm,
-      alias: serverForm.alias.trim(),
-      host: serverForm.host.trim(),
-      role: serverForm.role.trim(),
-      ssh_credential: serverForm.ssh_credential.trim(),
-      tags: serverTags.value.split(',').map((tag) => tag.trim()).filter(Boolean),
-    }, originalAlias.value)
+    const connectionChanged = serverConnectionFingerprint(input)
+      !== originalServerConnectionFingerprint.value
+    if ((!originalAlias.value || connectionChanged) && !serverConnectionVerified.value) {
+      if (!await testServerConnection(input)) return
+    }
+    await inventory.saveServer(input, originalAlias.value)
     showServerForm.value = false
   } catch (error) {
     localError.value = errorMessage(error)
@@ -203,7 +292,7 @@ onMounted(async () => {
       </div>
 
       <AsyncState :loading="inventory.loading" :error="inventory.error" @retry="inventory.load()">
-        <div v-if="activeTab === 'servers'" class="grid-cards">
+        <div v-if="activeTab === 'servers'" class="grid-cards server-grid">
           <article v-for="server in inventory.servers" :key="server.alias" class="panel-card server-card">
             <div class="server-card-top">
               <div>
@@ -312,8 +401,17 @@ onMounted(async () => {
           <div class="field"><label for="server-role">角色</label><input id="server-role" v-model="serverForm.role" class="input" placeholder="web / db / cache" /></div>
           <div class="field"><label for="server-credential">SSH 凭证</label><select id="server-credential" v-model="serverForm.ssh_credential" class="select" required><option disabled value="">请选择</option><option v-for="credential in inventory.credentials" :key="credential.id" :value="credential.id">{{ credential.id }} · {{ credential.username }}</option></select></div>
           <div class="field span-2"><label for="server-tags">标签</label><input id="server-tags" v-model="serverTags" class="input" placeholder="逗号分隔" /></div>
+          <div class="server-connection-check span-2" :data-state="displayedServerConnectionState">
+            <div>
+              <strong>SSH 连通性</strong>
+              <small>{{ displayedServerConnectionMessage }}</small>
+            </div>
+            <button class="btn btn-small" type="button" :disabled="inventory.testingServer || inventory.saving || !serverConnectionReady" @click="testServerConnection()">
+              {{ inventory.testingServer ? '测试中…' : '测试连接' }}
+            </button>
+          </div>
         </div>
-        <div class="dialog-footer"><button class="btn" type="button" @click="showServerForm = false">取消</button><button class="btn btn-primary" type="submit" :disabled="inventory.saving">保存</button></div>
+        <div class="dialog-footer"><button class="btn" type="button" @click="showServerForm = false">取消</button><button class="btn btn-primary" type="submit" :disabled="inventory.saving || inventory.testingServer">{{ serverSaveLabel }}</button></div>
       </form>
     </div>
 
@@ -341,6 +439,7 @@ onMounted(async () => {
 .resource-tabs button { display: flex; align-items: center; gap: 7px; padding: 9px 12px; border: 0; border-bottom: 2px solid transparent; background: transparent; color: var(--text-secondary); }
 .resource-tabs button.active { border-bottom-color: var(--accent); color: var(--text-primary); }
 .resource-tabs span { padding: 1px 5px; border-radius: 999px; background: var(--bg-tertiary); color: var(--text-muted); font-size: 10px; }
+.server-grid { grid-template-columns: repeat(auto-fill, minmax(300px, 380px)); justify-content: start; }
 .server-card { padding: 15px; }
 .server-card-top { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
 .server-card-top code { display: block; margin-top: 5px; color: var(--text-muted); font-size: 12px; }
@@ -357,4 +456,14 @@ onMounted(async () => {
 .server-checkboxes { min-height: 38px; display: flex; align-items: center; gap: 7px; flex-wrap: wrap; padding: 7px; border: 1px solid var(--border); border-radius: 7px; background: var(--bg-primary); }
 .server-checkboxes label { display: inline-flex; align-items: center; gap: 5px; padding: 4px 7px; border-radius: 5px; background: var(--bg-tertiary); color: var(--text-secondary); font-size: 11px; }
 .server-checkboxes input { accent-color: var(--accent); }
+.server-connection-check { min-height: 58px; display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 9px 10px; border: 1px solid var(--border); border-radius: 7px; background: var(--bg-primary); }
+.server-connection-check > div { min-width: 0; display: grid; gap: 3px; }
+.server-connection-check strong { color: var(--text-secondary); font-size: 11px; }
+.server-connection-check small { color: var(--text-muted); overflow-wrap: anywhere; }
+.server-connection-check[data-state='testing'] { border-color: var(--warning); }
+.server-connection-check[data-state='success'] { border-color: var(--success); }
+.server-connection-check[data-state='success'] small { color: var(--success); }
+.server-connection-check[data-state='error'] { border-color: var(--danger); }
+.server-connection-check[data-state='error'] small { color: var(--danger); }
+@media (max-width: 720px) { .server-grid { grid-template-columns: 1fr; } .server-connection-check { align-items: stretch; flex-direction: column; } .server-connection-check .btn { width: 100%; } }
 </style>

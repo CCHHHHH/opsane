@@ -1,6 +1,7 @@
 """Background knowledge learning from completed Shell Agent tasks."""
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -81,14 +82,54 @@ async def _task_evidence(db: aiosqlite.Connection, task_id: str) -> str:
     return compact_text("\n\n".join(chunks), limit=6000)
 
 
-def _service_snapshot(services: dict[str, Any], service_id: str, service_name: str) -> tuple[str, dict]:
+def _service_id(value: str) -> str:
+    normalized = re.sub(r"[^\w-]+", "-", value.strip().lower(), flags=re.UNICODE)
+    return normalized.strip("-_") or "service"
+
+
+def _service_snapshot(
+    services: dict[str, Any],
+    service_id: str,
+    service_name: str,
+    target: str,
+) -> tuple[str, dict]:
     normalized_id = service_id.strip().lower()
     normalized_name = service_name.strip().lower()
+    matches: list[tuple[str, dict]] = []
     for key, service in services.items():
         item = service.model_dump() if hasattr(service, "model_dump") else dict(service)
         if key.lower() == normalized_id or str(item.get("name") or "").lower() == normalized_name:
-            return str(item.get("id") or key), item
-    return service_id, {}
+            matches.append((str(item.get("id") or key), item))
+
+    if target:
+        for existing_id, item in matches:
+            if target in (item.get("servers") or []):
+                return existing_id, item
+    elif matches:
+        return matches[0]
+
+    base_id = _service_id(service_id or service_name)
+    if target:
+        target_id = _service_id(target)
+        suffix = f"-{target_id}"
+        instance_id = base_id if base_id.endswith(suffix) else f"{base_id}{suffix}"
+        for key, service in services.items():
+            item = service.model_dump() if hasattr(service, "model_dump") else dict(service)
+            if str(item.get("id") or key).lower() == instance_id.lower():
+                return str(item.get("id") or key), item
+        return instance_id, {}
+    return base_id, {}
+
+
+def _merge_profile_changes(existing: dict, incoming: dict) -> dict:
+    merged = dict(existing)
+    for key, value in incoming.items():
+        current = merged.get(key)
+        if isinstance(current, list) and isinstance(value, list):
+            merged[key] = list(dict.fromkeys([*current, *value]))
+        else:
+            merged[key] = value
+    return merged
 
 
 async def learn_from_task(
@@ -130,6 +171,7 @@ async def learn_from_task(
         result.errors.append("知识提取结果格式无效")
         return result
 
+    candidate_groups: dict[str, dict[str, Any]] = {}
     for raw in extracted["memories"][:12]:
         if not isinstance(raw, dict):
             continue
@@ -162,21 +204,48 @@ async def learn_from_task(
             services,
             item["service_id"],
             item["service_name"],
+            item["target"],
         )
+        group = candidate_groups.setdefault(
+            service_id,
+            {
+                "service_id": service_id,
+                "service_name": item["service_name"],
+                "proposed_changes": {},
+                "before_snapshot": before,
+                "targets": [],
+                "summaries": [],
+                "confidence": 1.0,
+                "source_memory_ids": [],
+            },
+        )
+        group["proposed_changes"] = _merge_profile_changes(
+            group["proposed_changes"], item["profile_changes"]
+        )
+        if item["target"] and item["target"] not in group["targets"]:
+            group["targets"].append(item["target"])
+        if item["evidence_summary"] and item["evidence_summary"] not in group["summaries"]:
+            group["summaries"].append(item["evidence_summary"])
+        group["confidence"] = min(group["confidence"], item["confidence"])
+        memory_id = str(memory.get("id") or "")
+        if memory_id:
+            group["source_memory_ids"].append(memory_id)
+
+    for group in candidate_groups.values():
         candidate, created = await create_profile_candidate(
             db,
-            service_id=service_id,
-            service_name=item["service_name"],
-            proposed_changes=item["profile_changes"],
-            before_snapshot=before,
+            service_id=group["service_id"],
+            service_name=group["service_name"],
+            proposed_changes=group["proposed_changes"],
+            before_snapshot=group["before_snapshot"],
             evidence={
                 "task_id": task_id,
                 "session_id": session_id,
-                "target": item["target"],
-                "summary": item["evidence_summary"],
+                "target": ", ".join(group["targets"]),
+                "summary": "；".join(group["summaries"]),
             },
-            confidence=item["confidence"],
-            source_memory_ids=[str(memory.get("id") or "")],
+            confidence=group["confidence"],
+            source_memory_ids=group["source_memory_ids"],
             source_task_id=task_id,
         )
         if created:

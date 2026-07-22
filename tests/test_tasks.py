@@ -6,6 +6,7 @@ from shell_agent.storage.tasks import (
     claim_task_confirmation,
     create_task,
     get_session_tasks,
+    get_task,
     get_task_events,
     update_task,
 )
@@ -50,6 +51,44 @@ async def test_task_confirmation_claim_is_scoped_and_atomic(tmp_path) -> None:
         assert claimed_task["status"] == "confirming"
         assert second is False
         assert duplicate_task["status"] == "confirming"
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_task_persists_frozen_skill_workflow_snapshot(tmp_path) -> None:
+    db_path = tmp_path / "shell_agent.db"
+    await init_db(str(db_path))
+    db = await connect(str(db_path))
+    try:
+        await db.execute(
+            """
+            INSERT INTO sessions (id, title, type, caller, source, status, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            ("sess_skill", "Skill", "chat", "test", "web", "active", "now", "now"),
+        )
+        await db.commit()
+        task = await create_task(db, "sess_skill", "chat", title="资源检查")
+        snapshot = {
+            "source": "skill",
+            "skill_name": "resource_summary",
+            "skill_version": "2",
+            "skill_hash": "abc123",
+            "step_queue": [{"command": "ssh dev-01 uptime"}],
+        }
+        await update_task(
+            db,
+            task["id"],
+            status="waiting_confirm",
+            pending_command="df -h",
+            pending_target="dev-01",
+            workflow_snapshot=snapshot,
+        )
+
+        stored = await get_task(db, task["id"])
+        assert stored is not None
+        assert stored["workflow_snapshot"] == snapshot
     finally:
         await db.close()
 

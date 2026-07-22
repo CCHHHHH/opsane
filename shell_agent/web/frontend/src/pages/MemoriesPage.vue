@@ -5,6 +5,7 @@ import { errorMessage } from '../api/http'
 import type { MemoryRecord, ProfileCandidateRecord } from '../api/protocol'
 import AsyncState from '../components/common/AsyncState.vue'
 import PageHeader from '../components/common/PageHeader.vue'
+import PaginationBar from '../components/common/PaginationBar.vue'
 import { useMemoriesStore } from '../stores/memories'
 import { confirmAction } from '../utils/confirm'
 
@@ -104,6 +105,11 @@ async function rejectCandidate() {
   }
 }
 
+async function rebaseCandidate(candidate: ProfileCandidateRecord) {
+  localError.value = ''
+  await memories.rebaseCandidate(candidate)
+}
+
 function statusLabel(status?: string): string {
   return ({
     inferred: '自动推断', confirmed: '已确认', promoted: '已晋升', stale: '已过期', conflicted: '有冲突',
@@ -118,6 +124,10 @@ function displayValue(value: unknown): string {
   if (Array.isArray(value)) return value.join('、')
   if (value && typeof value === 'object') return JSON.stringify(value, null, 2)
   return String(value ?? '-')
+}
+
+function changePage(section: KnowledgeTab, page: number) {
+  void memories.goToPage(section, page)
 }
 
 onMounted(() => {
@@ -138,20 +148,20 @@ onMounted(() => {
       <div v-if="localError || memories.error" class="notice notice-error">{{ localError || memories.error }}</div>
 
       <div class="knowledge-tabs">
-        <button type="button" :class="{ active: activeTab === 'memories' }" @click="activeTab = 'memories'">已确认记忆 <span>{{ memories.items.length }}</span></button>
-        <button type="button" :class="{ active: activeTab === 'candidates' }" @click="activeTab = 'candidates'">画像候选 <span>{{ memories.candidates.length }}</span></button>
-        <button type="button" :class="{ active: activeTab === 'issues' }" @click="activeTab = 'issues'">冲突与过期 <span>{{ memories.issues.length }}</span></button>
+        <button type="button" :class="{ active: activeTab === 'memories' }" @click="activeTab = 'memories'">已确认记忆 <span>{{ memories.memoryPagination.total }}</span></button>
+        <button type="button" :class="{ active: activeTab === 'candidates' }" @click="activeTab = 'candidates'">画像候选 <span>{{ memories.candidatePagination.total }}</span></button>
+        <button type="button" :class="{ active: activeTab === 'issues' }" @click="activeTab = 'issues'">冲突与过期 <span>{{ memories.issuePagination.total + memories.expiredCandidates.length }}</span></button>
       </div>
 
       <div v-if="activeTab === 'memories'" class="memory-toolbar">
-        <input v-model="memories.query" class="input" placeholder="搜索主题、值或目标" @keyup.enter="memories.load()" />
-        <select v-model="memories.typeFilter" class="select" @change="memories.load()">
+        <input v-model="memories.query" class="input" placeholder="搜索主题、值或目标" @keyup.enter="memories.search()" />
+        <select v-model="memories.typeFilter" class="select" @change="memories.search()">
           <option value="">全部类型</option><option value="fact">事实</option><option value="procedure">操作经验</option><option value="preference">用户偏好</option><option value="observation">临时观察</option>
         </select>
-        <select v-model="memories.statusFilter" class="select" @change="memories.load()">
+        <select v-model="memories.statusFilter" class="select" @change="memories.search()">
           <option value="">全部状态</option><option value="inferred">自动推断</option><option value="confirmed">已确认</option><option value="promoted">已晋升</option><option value="stale">已过期</option><option value="conflicted">有冲突</option>
         </select>
-        <button class="btn" type="button" @click="memories.load()">搜索</button>
+        <button class="btn" type="button" @click="memories.search()">搜索</button>
       </div>
 
       <AsyncState :loading="memories.loading" :error="memories.error" @retry="memories.load()">
@@ -174,6 +184,7 @@ onMounted(() => {
               </tbody>
             </table>
           </div>
+          <PaginationBar :page="memories.memoryPagination.page" :total-pages="memories.memoryPagination.totalPages" :total="memories.memoryPagination.total" @change="changePage('memories', $event)" />
         </div>
 
         <div v-else-if="activeTab === 'candidates'" class="candidate-grid">
@@ -189,23 +200,46 @@ onMounted(() => {
             <div class="card-actions"><button class="btn btn-primary btn-small" type="button" @click="openCandidate(candidate)">审核详情</button></div>
           </article>
           <div v-if="!memories.candidates.length" class="panel-card empty-state full-width"><strong>没有待审核候选</strong><span>任务发现稳定服务事实后，会在这里等待确认。</span></div>
+          <PaginationBar class="pagination-full" :page="memories.candidatePagination.page" :total-pages="memories.candidatePagination.totalPages" :total="memories.candidatePagination.total" @change="changePage('candidates', $event)" />
         </div>
 
-        <div v-else class="panel-card">
-          <div v-if="!memories.issues.length" class="empty-state"><strong>没有冲突或过期知识</strong><span>当前长期知识状态正常。</span></div>
-          <div v-else class="data-table-wrap knowledge-table-wrap">
-            <table class="data-table">
-              <thead><tr><th>主题</th><th>关系</th><th>内容</th><th>问题</th><th>目标</th><th>最后观察</th><th /></tr></thead>
-              <tbody>
-                <tr v-for="item in memories.issues" :key="String(item.id)">
-                  <td><strong>{{ item.subject }}</strong></td><td><code>{{ item.predicate }}</code></td><td class="memory-value">{{ item.value }}</td>
-                  <td><span class="badge" :class="item.status === 'conflicted' ? 'badge-danger' : 'badge-warning'">{{ statusLabel(item.status) }}</span></td>
-                  <td>{{ item.target || '-' }}</td><td>{{ item.observed_at || item.updated_at || '-' }}</td>
-                  <td><button class="btn btn-small" type="button" @click="openMemory(item)">处理</button></td>
-                </tr>
-              </tbody>
-            </table>
-          </div>
+        <div v-else class="issue-stack">
+          <section v-if="memories.expiredCandidates.length" class="panel-card">
+            <div class="section-heading"><div><h2>已过期画像候选</h2><p>画像版本已变化，需基于最新版重新检查后才能写入。</p></div></div>
+            <div class="data-table-wrap">
+              <table class="data-table expired-candidate-table">
+                <thead><tr><th>服务</th><th>目标服务器</th><th>建议字段</th><th>来源任务</th><th>状态</th><th /></tr></thead>
+                <tbody>
+                  <tr v-for="candidate in memories.expiredCandidates" :key="candidate.id">
+                    <td><strong>{{ candidate.service_name }}</strong><template v-if="candidate.service_id && candidate.service_id.toLowerCase() !== candidate.service_name.toLowerCase()"><br><code>{{ candidate.service_id }}</code></template></td>
+                    <td>{{ displayValue(candidate.proposed_changes?.servers ?? candidate.evidence?.target) }}</td>
+                    <td><span v-for="(_, key) in candidate.proposed_changes" :key="key" class="badge badge-accent field-badge">{{ key }}</span></td>
+                    <td><code>{{ candidate.source_task_id || '-' }}</code></td>
+                    <td><span class="badge badge-warning">已过期</span></td>
+                    <td><button class="btn btn-small expired-action" type="button" title="基于最新版重新合并" :disabled="memories.saving" @click="rebaseCandidate(candidate)">重新合并</button></td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+          </section>
+
+          <section v-if="memories.issues.length || !memories.expiredCandidates.length" class="panel-card">
+            <div v-if="!memories.issues.length" class="empty-state"><strong>没有冲突或过期知识</strong><span>当前长期知识状态正常。</span></div>
+            <div v-else class="data-table-wrap knowledge-table-wrap">
+              <table class="data-table">
+                <thead><tr><th>主题</th><th>关系</th><th>内容</th><th>问题</th><th>目标</th><th>最后观察</th><th /></tr></thead>
+                <tbody>
+                  <tr v-for="item in memories.issues" :key="String(item.id)">
+                    <td><strong>{{ item.subject }}</strong></td><td><code>{{ item.predicate }}</code></td><td class="memory-value">{{ item.value }}</td>
+                    <td><span class="badge" :class="item.status === 'conflicted' ? 'badge-danger' : 'badge-warning'">{{ statusLabel(item.status) }}</span></td>
+                    <td>{{ item.target || '-' }}</td><td>{{ item.observed_at || item.updated_at || '-' }}</td>
+                    <td><button class="btn btn-small" type="button" @click="openMemory(item)">处理</button></td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+            <PaginationBar :page="memories.issuePagination.page" :total-pages="memories.issuePagination.totalPages" :total="memories.issuePagination.total" @change="changePage('issues', $event)" />
+          </section>
         </div>
       </AsyncState>
     </div>
@@ -265,6 +299,13 @@ onMounted(() => {
 .candidate-fields { display: flex; flex-wrap: wrap; gap: 5px; min-height: 22px; }
 .card-actions { display: flex; justify-content: flex-end; margin-top: 12px; padding-top: 10px; border-top: 1px solid var(--border); }
 .full-width { grid-column: 1 / -1; }
+.pagination-full { grid-column: 1 / -1; border: 1px solid var(--border); border-radius: 7px; background: var(--bg-secondary); }
+.issue-stack { display: grid; gap: 12px; }
+.section-heading h2 { margin: 0; font-size: 15px; }
+.section-heading p { margin: 4px 0 0; color: var(--text-muted); font-size: 12px; }
+.field-badge { margin: 2px 4px 2px 0; }
+.expired-candidate-table th:nth-child(2), .expired-candidate-table td:nth-child(2) { min-width: 88px; }
+.expired-action { white-space: nowrap; }
 .memory-dialog { width: min(760px,100%); }
 .candidate-dialog { width: min(900px,100%); }
 .candidate-review { display: grid; gap: 14px; }

@@ -131,13 +131,20 @@ def test_command_preview_payload_field_contract() -> None:
     assert set(payload) == {
         "session_id",
         "task_id",
+        "operation_id",
         "turn_id",
         "channel",
+        "step_index",
+        "total_steps",
         "command",
         "target",
         "cwd",
         "intent",
         "explanation",
+        "skill_name",
+        "skill_version",
+        "skill_hash",
+        "skill_step_name",
         "confirm_mode",
         "policy_blocked",
         "policy_block_reason",
@@ -151,6 +158,7 @@ def test_command_preview_payload_field_contract() -> None:
     }
     assert payload["session_id"] == "sess_contract"
     assert payload["task_id"] == payload["turn_id"] == "task_contract"
+    assert payload["operation_id"] == command.id
     assert payload["channel"] == "chat"
     assert payload["risk_level"] == "dangerous"
     assert payload["requires_secondary_confirm"] is True

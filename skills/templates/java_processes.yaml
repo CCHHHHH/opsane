@@ -1,4 +1,5 @@
 name: java_processes
+version: "2"
 description: 查看服务器上的 Java 进程
 category: observe
 triggers:
@@ -9,7 +10,7 @@ triggers:
   - 运行了哪些java
 params:
   - name: target
-    type: string
+    type: server_alias
     required: true
     description: 目标服务器别名
 steps:
@@ -17,6 +18,8 @@ steps:
     command: "ssh {{target}} 'ps -ef | grep java | grep -v grep'"
     intent: "查看 {{target}} 上运行的 Java 进程"
     explanation: "使用 ps -ef 列出进程，通过 grep java 过滤 Java 进程，并排除 grep 命令本身。"
-    confirm: true
+    confirm: false
+    timeout_seconds: 30
+    on_failure: abort
 safety:
   default_confirm_mode: auto_safe

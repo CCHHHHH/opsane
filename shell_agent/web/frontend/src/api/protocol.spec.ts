@@ -1,6 +1,11 @@
 import { describe, expect, it } from 'vitest'
 
-import { isServerEvent, pendingFileTransferEvent } from './protocol'
+import {
+  commandPreviewsMatch,
+  isServerEvent,
+  pendingCommandEvent,
+  pendingFileTransferEvent,
+} from './protocol'
 
 describe('isServerEvent', () => {
   it('accepts typed and forward-compatible events', () => {
@@ -28,5 +33,19 @@ describe('isServerEvent', () => {
     })
     expect(pendingFileTransferEvent({ id: 'xfer-1', status: 'running' }, 'session-1')).toBeNull()
     expect(pendingFileTransferEvent({}, 'session-1')).toBeNull()
+  })
+
+  it('matches only the concrete command operation waiting for confirmation', () => {
+    const completedStep = pendingCommandEvent({
+      task_id: 'task-1', operation_id: 'cmd-2', step_index: 2,
+      command: '/app/stop.sh', target: 'dev-01',
+    }, 'session-1', 'chat')!
+    const pendingStep = pendingCommandEvent({
+      task_id: 'task-1', operation_id: 'cmd-3', step_index: 3,
+      command: '/app/start.sh', target: 'dev-01',
+    }, 'session-1', 'chat')!
+
+    expect(commandPreviewsMatch(completedStep, pendingStep)).toBe(false)
+    expect(commandPreviewsMatch(pendingStep, pendingStep)).toBe(true)
   })
 })
