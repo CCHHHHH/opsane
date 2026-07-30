@@ -307,8 +307,10 @@ def serve(config_path: str, host: str, port: int) -> None:
     setup_logging(config.logging.level, config.logging.dir)
 
     web_app = create_app(config_path=config_path)
-    print_info(f"Opsane Web 服务启动: http://{host}:{port}")
-    print_info(f"在浏览器打开上述地址即可使用可视化界面")
+    # Keep service bootstrap output ASCII-only. PyInstaller's redirected Windows
+    # streams may use a legacy code page even when the parent requests UTF-8.
+    click.echo(f"Opsane Web service starting: http://{host}:{port}")
+    click.echo("Open the address above in a browser to use Opsane.")
     uvicorn.run(web_app, host=host, port=port, log_level="info")
 
 
