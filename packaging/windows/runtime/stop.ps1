@@ -21,10 +21,17 @@ if (-not $Process) {
     exit 0
 }
 
-Stop-Process -Id $ProcessId
-try {
-    Wait-Process -Id $ProcessId -Timeout 10 -ErrorAction Stop
-} catch {
+Stop-Process -Id $ProcessId -Force -ErrorAction SilentlyContinue
+$Stopped = $false
+for ($Attempt = 0; $Attempt -lt 20; $Attempt++) {
+    if (-not (Get-Process -Id $ProcessId -ErrorAction SilentlyContinue)) {
+        $Stopped = $true
+        break
+    }
+    Start-Sleep -Milliseconds 500
+}
+
+if (-not $Stopped) {
     throw "Opsane process $ProcessId did not stop within 10 seconds."
 }
 

@@ -28,6 +28,14 @@ def test_portable_runtime_has_no_target_python_install_step() -> None:
     assert "venv" not in lowered
 
 
+def test_portable_stop_treats_an_already_exited_process_as_stopped() -> None:
+    stop_script = (WINDOWS_DIR / "runtime" / "stop.ps1").read_text()
+
+    assert "Get-Process -Id $ProcessId -ErrorAction SilentlyContinue" in stop_script
+    assert "if (-not $Stopped)" in stop_script
+    assert "Wait-Process" not in stop_script
+
+
 def test_portable_build_uses_blank_templates_and_smoke_test() -> None:
     build_script = (WINDOWS_DIR / "build_portable.ps1").read_text()
 
