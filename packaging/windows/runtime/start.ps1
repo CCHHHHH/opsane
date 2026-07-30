@@ -53,6 +53,19 @@ function Test-Health {
     }
 }
 
+function Show-FailureLogs {
+    if ($Process -and $Process.HasExited) {
+        Write-Host "Opsane process exited with code $($Process.ExitCode)."
+    }
+    foreach ($LogPath in @($OutLog, $ErrLog)) {
+        if (Test-Path $LogPath) {
+            Write-Host ""
+            Write-Host "===== $LogPath ====="
+            Get-Content $LogPath -Tail 100
+        }
+    }
+}
+
 if (-not (Test-Path $OpsaneExe)) {
     throw "Opsane.exe is missing. Extract the complete portable ZIP before starting."
 }
@@ -95,4 +108,5 @@ for ($Attempt = 0; $Attempt -lt 60; $Attempt++) {
 }
 
 Remove-Item $PidFile -Force -ErrorAction SilentlyContinue
+Show-FailureLogs
 throw "Opsane failed to start. Check $OutLog and $ErrLog."
