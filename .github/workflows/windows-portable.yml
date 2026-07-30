@@ -1,0 +1,54 @@
+name: Windows Portable
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows-portable:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          architecture: "x64"
+          cache: pip
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: shell_agent/web/frontend/package-lock.json
+
+      - name: Build Web frontend
+        shell: pwsh
+        run: |
+          npm ci --prefix shell_agent/web/frontend
+          npm run build --prefix shell_agent/web/frontend
+
+      - name: Build and smoke-test portable ZIP
+        shell: pwsh
+        run: ./packaging/windows/build_portable.ps1 -Python python
+
+      - name: Upload portable artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: opsane-windows-x64
+          path: |
+            release/Opsane-*-windows-x64.zip
+            release/Opsane-*-windows-x64.zip.sha256
+          if-no-files-found: error
+
+      - name: Publish tagged GitHub release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            release/Opsane-*-windows-x64.zip
+            release/Opsane-*-windows-x64.zip.sha256
