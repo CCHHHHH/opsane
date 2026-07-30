@@ -5,7 +5,9 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.syntax import Syntax
 
-console = Console()
+# The Web service redirects stdout/stderr to log files. Rich's legacy Windows
+# renderer writes Unicode symbols through Win32 APIs and crashes on cp1252 hosts.
+console = Console(legacy_windows=False)
 
 
 def print_command_preview(
