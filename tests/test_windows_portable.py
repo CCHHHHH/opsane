@@ -21,6 +21,8 @@ def test_portable_runtime_has_no_target_python_install_step() -> None:
 
     assert "opsane.exe" in lowered
     assert "127.0.0.1" in lowered
+    assert '$env:pythonutf8 = "1"' in lowered
+    assert '$env:pythonioencoding = "utf-8"' in lowered
     assert "python -m" not in lowered
     assert "pip install" not in lowered
     assert "venv" not in lowered

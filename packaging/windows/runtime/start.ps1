@@ -86,6 +86,11 @@ if (Test-Path $PidFile) {
     Remove-Item $PidFile -Force
 }
 
+# Redirected Windows console streams may otherwise inherit a legacy code page
+# which cannot encode the symbols used by Rich during startup.
+$env:PYTHONUTF8 = "1"
+$env:PYTHONIOENCODING = "utf-8"
+
 $Process = Start-Process -FilePath $OpsaneExe `
     -ArgumentList @("serve", "--config", "config/agent.yaml", "--host", "127.0.0.1", "--port", "$Port") `
     -WorkingDirectory $DataDir `
